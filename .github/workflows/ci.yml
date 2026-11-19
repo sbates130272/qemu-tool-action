@@ -6,6 +6,9 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -13,75 +16,139 @@ concurrency:
 jobs:
 
   lint:
-    name: Lint
+    name: Lint and unit tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4.3.1
 
-      - name: shellcheck
-        run: shellcheck -S error scripts/*.sh
+      - name: Syntax
+        run: |
+          python3 -m py_compile qemu_tool_action.py
+          for f in launch.js main.js post.js; do node --check "$f"; done
+          python3 -c "import yaml; yaml.safe_load(open('action.yml'))"
+          shellcheck tests/*.sh
 
-      - name: Validate action.yml is parseable YAML
-        run: python3 -c "import yaml, sys; yaml.safe_load(open('action.yml'))" && echo "action.yml OK"
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests -v
 
-  dry-run:
-    name: Dry-run smoke test
+      - name: Entry point, without a runner
+        run: tests/smoke.sh
+
+  operations:
+    name: install and command
     runs-on: ubuntu-latest
     steps:
-      - name: Check out the action itself
-        uses: actions/checkout@v4.3.1
-        with:
-          path: qemu-tool-action
+      - uses: actions/checkout@v4.3.1
 
-      - name: Check out qemu-minimal (source of qemu-tool)
-        uses: actions/checkout@v4.3.1
+      - name: install
+        id: install
+        uses: ./
         with:
-          repository: sbates130272/qemu-minimal
-          path: qemu-minimal
+          operation: install
 
-      - name: run-vm dry-run via action
-        id: run_vm
-        uses: ./qemu-tool-action
-        with:
-          operation: run-vm
-          qemu-tool-source: ./qemu-minimal/qemu
-          vm-name: ci-test
-          ssh-port: '2222'
-          extra-args: --dry-run --no-kvm
-
-      - name: Verify vm-manifest output
+      - name: The install is on PATH for later steps
         run: |
-          echo "Manifest: ${{ steps.run_vm.outputs.vm-manifest }}"
-          echo '${{ steps.run_vm.outputs.vm-manifest }}' | python3 -c "
+          set -eu
+          [ "$(command -v qemu-tool)" = "${{ steps.install.outputs.qemu-tool-path }}" ]
+          qemu-tool --version | grep -F "${{ steps.install.outputs.qemu-tool-version }}"
+          oras version
+          qemu-tool check || echo "::warning::qemu-tool check reported a failure"
+
+      - name: command
+        uses: ./
+        with:
+          operation: command
+          args: run-vm --vm-name ci-test --dry-run --no-kvm
+
+      - name: A v1 operation is refused with the migration named
+        id: v1
+        continue-on-error: true
+        uses: ./
+        with:
+          operation: gen-vm
+
+      - name: It was refused
+        run: '[ "${{ steps.v1.outcome }}" = failure ]'
+
+  boot:
+    name: Boot one guest
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4.3.1
+
+      # One guest: four vCPUs is the RDMA driver's floor and a hosted runner
+      # has four cores.
+      - name: up
+        id: fleet
+        uses: ./
+        with:
+          vm-count: 1
+          wait-for: rdma
+          copy: |
+            tests:action-tests
+          run: |
+            set -x
+            test -f smoke.sh
+            [ "$QT_VM_INDEX" = 1 ] && [ "$QT_VM_COUNT" = 1 ]
+            nproc
+            lspci -nn | grep 1dd8:1002
+            ibv_devinfo -d "$QT_RDMA_DEVICE" | grep PORT_ACTIVE
+
+      - name: The outputs describe the guest
+        env:
+          MANIFEST: ${{ steps.fleet.outputs.vm-manifest }}
+        run: |
+          set -eu
+          echo "$MANIFEST" | python3 -c '
           import json, sys
           m = json.load(sys.stdin)
-          assert len(m) == 1, f'expected 1 entry, got: {m}'
-          assert m[0]['name'] == 'ci-test', m
-          assert m[0]['ssh_port'] == 2222, m
-          assert m[0]['image_path'] is None, m
-          print('vm-manifest OK')
-          "
+          assert len(m) == 1 and m[0]["rdma_device"], m
+          print(m[0]["ssh_cmd"])'
+          [ "${{ steps.fleet.outputs.vm-count }}" = 1 ]
+          ssh -F "$QEMU_TOOL_SSH_CONFIG" vm1 uname -r
+          qemu-tool ssh ${{ steps.fleet.outputs.vm-names }} -- true
+          qemu-tool compose ps
 
-      - name: gen-vm dry-run via action (--dry-run in extra-args is not valid for gen-vm, use run-vm)
-        id: gen_vm
-        uses: ./qemu-tool-action
+      - name: exec
+        uses: ./
         with:
-          operation: run-vm
-          qemu-tool-source: ./qemu-minimal/qemu
-          vm-name: ci-gen-test
-          ssh-port: '2333'
-          arch: amd64
-          vcpus: '4'
-          vmem: '8192'
-          extra-args: --dry-run --no-kvm
+          operation: exec
+          run-on: first
+          env: |
+            GREETING=hello there
+          run: |
+            [ "$GREETING" = "hello there" ]
+            pwd | grep -q action-tests
 
-      - name: Verify gen-vm manifest shape
+      - name: A failing script fails the step
+        id: failing
+        continue-on-error: true
+        uses: ./
+        with:
+          operation: exec
+          run: exit 3
+
+      - name: It failed
+        run: '[ "${{ steps.failing.outcome }}" = failure ]'
+
+      - name: down
+        id: down
+        if: always()
+        uses: ./
+        with:
+          operation: down
+
+      - name: Nothing is left running
+        if: always()
         run: |
-          echo "Manifest: ${{ steps.gen_vm.outputs.vm-manifest }}"
-          echo '${{ steps.gen_vm.outputs.vm-manifest }}' | python3 -c "
-          import json, sys
-          m = json.load(sys.stdin)
-          assert m[0]['name'] == 'ci-gen-test', m
-          assert m[0]['ssh_port'] == 2333, m
-          print('gen-vm manifest shape OK')
-          "
+          left=$(docker ps -q --filter label=com.docker.compose.project=ci | wc -l)
+          [ "$left" -eq 0 ]
+
+      - name: Upload logs
+        if: always() && steps.down.outputs.logs-dir != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: fleet-logs
+          path: ${{ steps.down.outputs.logs-dir }}
+          if-no-files-found: ignore

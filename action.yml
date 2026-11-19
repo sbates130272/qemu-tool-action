@@ -1,7 +1,7 @@
 name: qemu-tool
 description: >-
-  Orchestrate qemu-tool gen-vm, run-vm, compose, and gen-compose operations
-  inside a GitHub Actions job.
+  Boot QEMU guests with emulated ROCm GPUs, RDMA NICs and NVMe in a CI job,
+  run commands in them, and tear them down.
 
 branding:
   icon: cpu
@@ -9,399 +9,204 @@ branding:
 
 inputs:
   operation:
-    description: 'Subcommand to run: gen-vm, run-vm, compose, or gen-compose'
-    required: true
-
-  env-file:
     description: >-
-      Path to a qemu-tool env-file (KEY=VALUE pairs). All non-system variables
-      are exported to $GITHUB_ENV before the subcommand runs, making them
-      available to subsequent steps too. This is the primary mechanism for
-      multi-VM compose stacks (VM1_NAME, VM2_NAME, VM_NAMES, VM_SSH_PORTS, …).
+      up (default): install qemu-tool, boot a fleet of guests, wait for them,
+      optionally copy files in and run a script; the fleet is torn down when
+      the job ends. install: install qemu-tool and prepare the host, nothing
+      else. exec: copy files into, or run a script on, the guests an earlier
+      up step booted. command: run one qemu-tool command line (args). down:
+      collect logs and tear the fleet down now.
     required: false
+    default: up
 
-  vm-name:
-    description: VM name passed as --vm-name. Used for single-VM operations.
-    required: false
-    default: qemu-minimal
-
-  arch:
-    description: 'Target architecture: amd64, arm64, or riscv64'
-    required: false
-    default: amd64
-
-  vcpus:
-    description: Number of vCPUs (--vcpus). Omitted from the command when not set.
-    required: false
-
-  vmem:
-    description: Guest memory in MiB (--vmem). Omitted from the command when not set.
-    required: false
-
-  images-dir:
-    description: Directory qemu-tool reads and writes VM images.
-    required: false
-    default: /var/lib/qemu-tool/images
-
-  ssh-port:
-    description: Host-side SSH port forwarded to guest port 22 (--ssh-port).
-    required: false
-    default: '2222'
-
-  release:
-    description: Ubuntu release codename for gen-vm (--release).
-    required: false
-    default: resolute
-
-  size:
-    description: Disk size in GB for gen-vm (--size). Omitted when not set.
-    required: false
-
-  packages:
-    description: Packages manifest name or path for gen-vm (--packages). Omitted when not set.
-    required: false
-
-  backing-image:
-    description: OCI reference for gen-vm --backing-image. Omitted when not set.
-    required: false
-
-  backing-file:
-    description: Local path to an existing qcow2 for gen-vm --backing-file. Omitted when not set.
-    required: false
-
-  ansible-playbook:
-    description: Ansible playbook path for gen-vm --ansible-playbook. Omitted when not set.
-    required: false
-
-  stack:
-    description: Compose stack name for compose and gen-compose (--stack).
-    required: false
-    default: vfio-user-ernic-rocjitsu-vm
-
-  compose-args:
-    description: >-
-      Extra arguments passed verbatim after the compose subcommand (word-split).
-      Example: "up --detach --no-deps ernic rocjitsu".
-    required: false
-
-  compose-profiles:
-    description: >-
-      Comma-separated Docker Compose profiles to enable. Translates to
-      --profile PROFILE for each entry, placed after the "--" separator that
-      separates qemu-tool flags from docker-compose flags.
-      Example: "rocjitsu-vm1,rocjitsu-vm2".
-    required: false
-
-  wait-for-healthy:
-    description: >-
-      When true and operation is compose, poll all services until they report
-      healthy or wait-timeout seconds elapse.
-    required: false
-    default: 'false'
-
-  wait-timeout:
-    description: Seconds to wait when wait-for-healthy is true.
-    required: false
-    default: '120'
-
-  extra-args:
-    description: >-
-      Additional CLI flags appended verbatim (word-split) to the end of the
-      qemu-tool command. Use for flags not exposed as dedicated inputs, e.g.
-      "--dry-run --no-kvm" or "--restore-image".
-    required: false
-
-  qemu-tool-source:
-    description: >-
-      Path to a qemu-tool source checkout to install from (pip install -e).
-      When set, qemu-tool-version is ignored. Pass ./qemu when calling from
-      a qemu-minimal checkout to use the in-repo version.
-    required: false
-
+  # ── Installing qemu-tool ──────────────────────────────────────────────
   qemu-tool-version:
     description: >-
-      PyPI version to install when qemu-tool-source is not set. Use "latest"
-      (the default) for no version pin, or a specific version like "1.4.1".
+      What to install from PyPI: a version (2.1.0), a pip specifier
+      (">=2.1,<3", the default) or "latest".
     required: false
-    default: latest
+    default: '>=2.1,<3'
+  qemu-tool-source:
+    description: >-
+      Path to the qemu/ directory of a qemu-minimal checkout to install from
+      instead of PyPI. Overrides qemu-tool-version.
+    required: false
+  install:
+    description: Set false to use the qemu-tool already on PATH.
+    required: false
+    default: 'true'
+  setup-host:
+    description: >-
+      Make /dev/kvm usable by this user and install what is missing of oras,
+      qemu-utils, ansible-core, git and openssh-client. Set false on a
+      runner you have prepared yourself.
+    required: false
+    default: 'true'
+  oras-version:
+    description: oras release installed when the runner has none, or one older than 1.3.4.
+    required: false
+    default: '1.3.4'
+
+  # ── The fleet (operation: up) ─────────────────────────────────────────
+  flavor:
+    description: >-
+      Shipped fleet to boot: default (rocm-golden: guests with one gfx1250
+      GPU, one NVMe, one rocm-ernic RDMA NIC, one SDXI device), mi355x or
+      helios.
+    required: false
+    default: default
+  xml:
+    description: >-
+      Fleet XML settings files, one per line, later files overriding earlier
+      ones. Replaces the flavor's own file. The inputs below are applied on
+      top.
+    required: false
+  vm-count:
+    description: Number of guests (<vm-count>). Default, the fleet's own, 2 for the default flavor.
+    required: false
+  vcpus:
+    description: >-
+      vCPUs per guest (<vm-vcpus>). Default: sized from the runner, never
+      below 4, which the RDMA driver needs.
+    required: false
+  vmem:
+    description: Guest RAM in MiB (<vm-vmem>). Default, sized from the runner.
+    required: false
+  fleet:
+    description: >-
+      Any other fleet XML elements, one `element: value` per line, e.g.
+      `vm-nvme: 2` or `ernic-per-vm: 2`.
+    required: false
+  size-from-host:
+    description: >-
+      Derive guest vCPUs and RAM from the runner. Turned off by vcpus or
+      vmem.
+    required: false
+    default: 'true'
+  metrics:
+    description: Also start Prometheus, Grafana and log collection.
+    required: false
+    default: 'false'
+  clean-overlays:
+    description: >-
+      Start every guest from a fresh overlay of the published image rather
+      than disks an earlier job left behind.
+    required: false
+    default: 'true'
+  wait-for:
+    description: >-
+      ssh (default): return once every guest answers SSH. rdma: also wait
+      for each guest's RDMA device to report PORT_ACTIVE. none: return as
+      soon as the stack is up.
+    required: false
+    default: ssh
+  wait-timeout:
+    description: Seconds to wait for the guests.
+    required: false
+    default: '900'
+  in-network:
+    description: >-
+      Reach the guests on the stack's Docker network rather than on
+      published host ports. auto (default) does so when the job itself runs
+      in a container.
+    required: false
+    default: auto
+  teardown:
+    description: >-
+      always (default): collect logs and tear the fleet down when the job
+      ends. never: leave it running.
+    required: false
+    default: always
+  log-lines:
+    description: Lines of each container's log printed at teardown. 0 prints none; all of it is written to logs-dir either way.
+    required: false
+    default: '40'
+  extra-args:
+    description: Further flags for `qemu-tool quick-start up`.
+    required: false
+
+  # ── Where things go ───────────────────────────────────────────────────
+  work-dir:
+    description: >-
+      Root of everything written. Default /var/lib/qemu-tool, created if
+      absent, else a directory under RUNNER_TEMP.
+    required: false
+  stack-name:
+    description: Name of the stack, which is its compose project name.
+    required: false
+    default: ci
+  stack-dir:
+    description: Where the stack is generated. Default <work-dir>/stacks/<stack-name>. Names the fleet for exec and down.
+    required: false
+  key-dir:
+    description: Where the guest image's SSH keypair is pulled to. Default <work-dir>/keys/<stack-name>.
+    required: false
+  images-dir:
+    description: Where the guest qcow2 files go. Default <work-dir>/images. Needs about 30 GB.
+    required: false
+
+  # ── In the guests (operations up and exec) ────────────────────────────
+  copy:
+    description: >-
+      Files or directories to copy into the guests, one `source[:destination]`
+      per line. A destination is relative to the guest account's home; the
+      default is `workspace` for a directory.
+    required: false
+  run:
+    description: >-
+      A bash script to run in the guests, in a login shell with `set -eo
+      pipefail`. It sees QT_VM_NAME, QT_VM_INDEX, QT_VM_COUNT, QT_RDMA_IP,
+      QT_RDMA_DEVICE, QT_PEER_RDMA_IPS and QT_VM_<n>_RDMA_IP. With several
+      guests it runs on all of them at once.
+    required: false
+  run-on:
+    description: 'Guests copy and run apply to: all (default), first, last, or a list of guest names or indexes.'
+    required: false
+    default: all
+  working-directory:
+    description: Directory in the guest the script starts in. Default, the destination of the first directory copied, else home.
+    required: false
+  env:
+    description: Extra environment for the script, one KEY=VALUE per line.
+    required: false
+
+  # ── operation: command ────────────────────────────────────────────────
+  args:
+    description: 'The qemu-tool command line, without `qemu-tool`. E.g. `gen-compose --xml fleet.xml --check`.'
+    required: false
 
 outputs:
   vm-manifest:
     description: >-
-      JSON array of VM descriptors, one entry per VM:
-      [{"name":"vm1","ssh_port":2222,"image_path":"/path/to/vm1.qcow2"}, ...].
-      image_path is null for run-vm (no image created). Empty array [] for
-      gen-compose. SSH ports and VM names for multi-VM compose stacks are
-      derived from env-file variables (VM1_NAME/VM2_NAME/VM_NAMES/VM_SSH_PORTS).
-    value: ${{ steps.capture-outputs.outputs.vm-manifest }}
+      JSON array, one object per guest: name, index, ssh_host, ssh_port,
+      username, ssh_key_file, ssh_cmd, rdma_ip, rdma_ips, rdma_device.
+  vm-names:
+    description: The guest names, space separated.
+  vm-count:
+    description: How many guests are up.
+  ssh-config:
+    description: An ssh config file naming every guest, for `ssh -F`. Also exported as QEMU_TOOL_SSH_CONFIG.
+  inventory:
+    description: An Ansible inventory of the guests.
+  key-file:
+    description: The private key the guests accept.
+  stack-dir:
+    description: The generated stack. Also exported as QEMU_TOOL_STACK, so `qemu-tool compose ps` works from any step.
+  stack-name:
+    description: The compose project name.
+  key-dir:
+    description: Directory holding the keypair and the image's vm-info.json.
+  images-dir:
+    description: Directory holding the guest images.
+  logs-dir:
+    description: Where container and guest logs are written at teardown.
+  qemu-tool-version:
+    description: The qemu-tool version installed.
+  qemu-tool-path:
+    description: Path of the qemu-tool installed.
 
 runs:
-  using: composite
-  steps:
-
-    # ------------------------------------------------------------------ #
-    # 1. Install qemu-tool                                                 #
-    # ------------------------------------------------------------------ #
-    - name: Install qemu-tool from source
-      if: inputs.qemu-tool-source != ''
-      shell: bash
-      run: |
-        echo "::group::Install qemu-tool (source: ${{ inputs.qemu-tool-source }})"
-        pip install --break-system-packages -e "${{ inputs.qemu-tool-source }}"
-        echo "::endgroup::"
-
-    - name: Install qemu-tool from PyPI
-      if: inputs.qemu-tool-source == ''
-      shell: bash
-      run: |
-        echo "::group::Install qemu-tool (${{ inputs.qemu-tool-version }})"
-        if [ "${{ inputs.qemu-tool-version }}" = "latest" ]; then
-          pip install --break-system-packages qemu-tool
-        else
-          pip install --break-system-packages "qemu-tool==${{ inputs.qemu-tool-version }}"
-        fi
-        echo "::endgroup::"
-
-    # ------------------------------------------------------------------ #
-    # 2. Load env-file (before images-dir so VM_IMAGES_DIR can override)  #
-    # All script content is inlined rather than sourced from scripts/ so  #
-    # the action works inside container: jobs, where the runner bind-      #
-    # mounts only the workspace, not the action's downloaded directory.   #
-    # ------------------------------------------------------------------ #
-    - name: Load env-file
-      if: inputs.env-file != ''
-      shell: bash
-      run: |
-        echo "::group::Load env-file: ${{ inputs.env-file }}"
-        set -euo pipefail
-        ENV_FILE="${{ inputs.env-file }}"
-        if [ ! -f "$ENV_FILE" ]; then
-          echo "::error::env-file not found: $ENV_FILE"
-          exit 1
-        fi
-        echo "Loading $ENV_FILE into GITHUB_ENV"
-        while IFS= read -r line || [ -n "$line" ]; do
-          [[ "$line" =~ ^[[:space:]]*$ ]] && continue
-          [[ "$line" =~ ^[[:space:]]*# ]] && continue
-          KEY="${line%%=*}"
-          case "$KEY" in
-            PATH | HOME | SHELL | USER | GITHUB_* | RUNNER_*)
-              echo "  Skipping protected variable: $KEY"
-              continue
-              ;;
-          esac
-          echo "  Exporting: $KEY"
-          echo "$line" >> "$GITHUB_ENV"
-        done < "$ENV_FILE"
-        echo "::endgroup::"
-
-    # ------------------------------------------------------------------ #
-    # 3. Ensure images directory exists                                    #
-    # ------------------------------------------------------------------ #
-    - name: Ensure images directory exists
-      shell: bash
-      run: mkdir -p "${{ inputs.images-dir }}" && chmod 777 "${{ inputs.images-dir }}"
-
-    # ------------------------------------------------------------------ #
-    # 4. Run the qemu-tool operation                                       #
-    # ------------------------------------------------------------------ #
-    - name: Run qemu-tool ${{ inputs.operation }}
-      id: run-operation
-      shell: bash
-      env:
-        QT_OPERATION:        ${{ inputs.operation }}
-        QT_VM_NAME:          ${{ inputs.vm-name }}
-        QT_ARCH:             ${{ inputs.arch }}
-        QT_VCPUS:            ${{ inputs.vcpus }}
-        QT_VMEM:             ${{ inputs.vmem }}
-        QT_IMAGES_DIR:       ${{ inputs.images-dir }}
-        QT_SSH_PORT:         ${{ inputs.ssh-port }}
-        QT_RELEASE:          ${{ inputs.release }}
-        QT_SIZE:             ${{ inputs.size }}
-        QT_PACKAGES:         ${{ inputs.packages }}
-        QT_BACKING_IMAGE:    ${{ inputs.backing-image }}
-        QT_BACKING_FILE:     ${{ inputs.backing-file }}
-        QT_ANSIBLE_PLAYBOOK: ${{ inputs.ansible-playbook }}
-        QT_STACK:            ${{ inputs.stack }}
-        QT_COMPOSE_ARGS:     ${{ inputs.compose-args }}
-        QT_COMPOSE_PROFILES: ${{ inputs.compose-profiles }}
-        QT_EXTRA_ARGS:       ${{ inputs.extra-args }}
-      run: |
-        echo "::group::qemu-tool $QT_OPERATION"
-        set -euo pipefail
-        CMD=(qemu-tool "$QT_OPERATION")
-        case "$QT_OPERATION" in
-          gen-vm)
-            CMD+=(--vm-name  "$QT_VM_NAME")
-            CMD+=(--arch     "$QT_ARCH")
-            CMD+=(--images   "$QT_IMAGES_DIR")
-            CMD+=(--ssh-port "$QT_SSH_PORT")
-            CMD+=(--release  "$QT_RELEASE")
-            [ -n "$QT_VCPUS"            ] && CMD+=(--vcpus            "$QT_VCPUS")
-            [ -n "$QT_VMEM"             ] && CMD+=(--vmem             "$QT_VMEM")
-            [ -n "$QT_SIZE"             ] && CMD+=(--size             "$QT_SIZE")
-            [ -n "$QT_PACKAGES"         ] && CMD+=(--packages         "$QT_PACKAGES")
-            [ -n "$QT_BACKING_IMAGE"    ] && CMD+=(--backing-image    "$QT_BACKING_IMAGE")
-            [ -n "$QT_BACKING_FILE"     ] && CMD+=(--backing-file     "$QT_BACKING_FILE")
-            [ -n "$QT_ANSIBLE_PLAYBOOK" ] && CMD+=(--ansible-playbook "$QT_ANSIBLE_PLAYBOOK")
-            ;;
-          run-vm)
-            CMD+=(--vm-name  "$QT_VM_NAME")
-            CMD+=(--arch     "$QT_ARCH")
-            CMD+=(--images   "$QT_IMAGES_DIR")
-            CMD+=(--ssh-port "$QT_SSH_PORT")
-            [ -n "$QT_VCPUS" ] && CMD+=(--vcpus "$QT_VCPUS")
-            [ -n "$QT_VMEM"  ] && CMD+=(--vmem  "$QT_VMEM")
-            ;;
-          compose)
-            CMD+=(--vm-name "$QT_VM_NAME")
-            CMD+=(--images  "$QT_IMAGES_DIR")
-            CMD+=(--stack   "$QT_STACK")
-            # Profile flags start with -- so they must come after the -- separator
-            # to avoid being parsed as qemu-tool options. Compose subcommand args
-            # (up, down, ps, …) must NOT have -- before them: docker compose uses
-            # cobra, which only routes subcommands that appear before --, not after.
-            if [ -n "$QT_COMPOSE_PROFILES" ]; then
-              CMD+=(--) # end of qemu-tool flags; docker compose processes what follows
-              IFS=',' read -ra PROFILES <<< "$QT_COMPOSE_PROFILES"
-              for p in "${PROFILES[@]}"; do
-                CMD+=(--profile "$p")
-              done
-            fi
-            if [ -n "$QT_COMPOSE_ARGS" ]; then
-              read -ra COMPOSE_PASS <<< "$QT_COMPOSE_ARGS"
-              CMD+=("${COMPOSE_PASS[@]}")
-            fi
-            ;;
-          gen-compose)
-            CMD+=(--stack "$QT_STACK")
-            ;;
-          *)
-            echo "::error::Unknown operation: $QT_OPERATION"
-            echo "::error::Must be one of: gen-vm, run-vm, compose, gen-compose"
-            exit 1
-            ;;
-        esac
-        if [ -n "$QT_EXTRA_ARGS" ]; then
-          read -ra EXTRA <<< "$QT_EXTRA_ARGS"
-          CMD+=("${EXTRA[@]}")
-        fi
-        echo "Running: ${CMD[*]}"
-        "${CMD[@]}"
-        echo "::endgroup::"
-
-    # ------------------------------------------------------------------ #
-    # 5. Wait for compose health (optional)                                #
-    # ------------------------------------------------------------------ #
-    - name: Wait for compose services healthy
-      if: inputs.operation == 'compose' && inputs.wait-for-healthy == 'true'
-      shell: bash
-      run: |
-        echo "::group::Wait for healthy (timeout ${{ inputs.wait-timeout }}s)"
-        set -euo pipefail
-        STACK="${{ inputs.stack }}"
-        TIMEOUT="${{ inputs.wait-timeout }}"
-        elapsed=0
-        echo "Waiting for compose stack '$STACK' (timeout ${TIMEOUT}s)..."
-        while [ "$elapsed" -lt "$TIMEOUT" ]; do
-          services=$(qemu-tool compose --stack "$STACK" ps --services 2>/dev/null || true)
-          if [ -z "$services" ]; then
-            echo "  No services found yet (${elapsed}s elapsed)"
-            sleep 5
-            elapsed=$((elapsed + 5))
-            continue
-          fi
-          all_healthy=true
-          for svc in $services; do
-            health=$(qemu-tool compose --stack "$STACK" ps --format json "$svc" \
-              | python3 -c "
-        import sys, json
-        data = json.load(sys.stdin)
-        def classify(h):
-            # Empty string means no healthcheck defined; treat as healthy so
-            # services without a healthcheck (e.g. the qemu container) do not
-            # block the wait loop.
-            return 'healthy' if h in ('', 'healthy') else h
-        if isinstance(data, list):
-            healths = [classify(d.get('Health', '')) for d in data]
-            print('healthy' if healths and all(h == 'healthy' for h in healths) else (healths[0] if healths else 'unknown'))
-        else:
-            print(classify(data.get('Health', '')))
-        " 2>/dev/null || echo "unknown")
-            printf "  %-20s %s\n" "$svc" "$health"
-            [ "$health" = "healthy" ] || all_healthy=false
-          done
-          if [ "$all_healthy" = "true" ]; then
-            echo "All services healthy after ${elapsed}s"
-            echo "::endgroup::"
-            exit 0
-          fi
-          sleep 5
-          elapsed=$((elapsed + 5))
-        done
-        echo "::error::Timed out waiting for healthy services after ${TIMEOUT}s"
-        qemu-tool compose --stack "$STACK" ps || true
-        echo "::endgroup::"
-        exit 1
-
-    # ------------------------------------------------------------------ #
-    # 6. Capture outputs — runs even on failure so callers can inspect     #
-    # ------------------------------------------------------------------ #
-    - name: Capture outputs
-      id: capture-outputs
-      if: always()
-      shell: bash
-      env:
-        QT_OPERATION:  ${{ inputs.operation }}
-        QT_VM_NAME:    ${{ inputs.vm-name }}
-        QT_SSH_PORT:   ${{ inputs.ssh-port }}
-        QT_IMAGES_DIR: ${{ inputs.images-dir }}
-        QT_STACK:      ${{ inputs.stack }}
-      run: |
-        python3 - <<'PY'
-        import os, json, pathlib
-
-        operation  = os.environ.get('QT_OPERATION', '')
-        images_dir = os.environ.get('QT_IMAGES_DIR', '/var/lib/qemu-tool/images')
-
-        def find_image(name):
-            p = pathlib.Path(images_dir) / f"{name}.qcow2"
-            return str(p) if p.exists() else None
-
-        manifest = []
-
-        if operation == 'gen-compose':
-            pass
-        elif operation in ('gen-vm', 'run-vm'):
-            name     = os.environ.get('QT_VM_NAME', 'qemu-minimal')
-            ssh_port = int(os.environ.get('QT_SSH_PORT', '2222'))
-            image    = find_image(name) if operation == 'gen-vm' else None
-            manifest.append({'name': name, 'ssh_port': ssh_port, 'image_path': image})
-        elif operation == 'compose':
-            vm_names_raw  = os.environ.get('VM_NAMES', '')
-            ssh_ports_raw = os.environ.get('VM_SSH_PORTS', '')
-            vm1_name = os.environ.get('VM1_NAME', '')
-            vm2_name = os.environ.get('VM2_NAME', '')
-            vm1_port = os.environ.get('VM1_SSH_PORT', '')
-            vm2_port = os.environ.get('VM2_SSH_PORT', '')
-            vm_name  = os.environ.get('VM_NAME', os.environ.get('QT_VM_NAME', 'qemu-minimal'))
-            vm_port  = int(os.environ.get('VM_SSH_PORT', os.environ.get('QT_SSH_PORT', '2222')))
-            if vm_names_raw:
-                names = [n.strip() for n in vm_names_raw.split(',') if n.strip()]
-                ports = [int(p.strip()) for p in ssh_ports_raw.split(',') if p.strip()] if ssh_ports_raw else []
-                for i, name in enumerate(names):
-                    port = ports[i] if i < len(ports) else vm_port + i
-                    manifest.append({'name': name, 'ssh_port': port, 'image_path': find_image(name)})
-            elif vm1_name and vm2_name:
-                p1 = int(vm1_port) if vm1_port else 2222
-                p2 = int(vm2_port) if vm2_port else 2223
-                manifest.append({'name': vm1_name, 'ssh_port': p1, 'image_path': find_image(vm1_name)})
-                manifest.append({'name': vm2_name, 'ssh_port': p2, 'image_path': find_image(vm2_name)})
-            else:
-                manifest.append({'name': vm_name, 'ssh_port': vm_port, 'image_path': find_image(vm_name)})
-
-        result = json.dumps(manifest)
-        with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-            print(f"vm-manifest={result}", file=f)
-        print(f"VM manifest: {result}")
-        PY
+  using: node24
+  main: main.js
+  post: post.js
+  post-if: always()
