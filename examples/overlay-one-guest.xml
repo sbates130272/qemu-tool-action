@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- An overlay names only what it changes. Layered on a shipped flavor or
+     on a fleet of your own with the action's `xml-overlay` input. -->
+<fleet xmlns="http://qemu-tool/fleet/1.0">
+  <vm-count>1</vm-count>
+  <vm-name-prefix>ci</vm-name-prefix>
+</fleet>

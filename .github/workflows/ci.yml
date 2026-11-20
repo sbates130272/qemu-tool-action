@@ -146,8 +146,51 @@ jobs:
           operation: command
           args: run-vm --vm-name ci-test --dry-run --no-kvm
 
+  # A release pinned by tag: what `qemu-tool-ref` is for. No guest.
+  ref:
+    name: install from a tag of qemu-minimal
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: install
+        id: install
+        uses: ./
+        with:
+          operation: install
+          qemu-tool-ref: v2.1.0
+
+      - name: The tag, its commit, and a checkout to read
+        env:
+          VERSION: ${{ steps.install.outputs.qemu-tool-version }}
+          SHA: ${{ steps.install.outputs.qemu-tool-sha }}
+          CHECKOUT: ${{ steps.install.outputs.qemu-tool-checkout }}
+        run: |
+          set -eu
+          [ "$VERSION" = 2.1.0 ]
+          [ "${#SHA}" = 40 ]
+          [ "$(git -C "$CHECKOUT" rev-parse HEAD)" = "$SHA" ]
+          test -f "$CHECKOUT/qemu/stacks/rocm-golden.xml"
+          qemu-tool --version
+
+      - name: A second way to say which qemu-tool is refused
+        id: both
+        continue-on-error: true
+        uses: ./
+        with:
+          operation: install
+          qemu-tool-ref: v2.1.0
+          qemu-tool-version: 2.1.0
+
+      - name: It was refused
+        env:
+          OUTCOME: ${{ steps.both.outcome }}
+        run: '[ "$OUTCOME" = failure ]'
+
   # qemu-tool's unreleased main. Not on pull requests, so that a break
   # upstream is seen here without blocking a change that did not cause it.
+  # smoke.sh renders every fleet main ships, the action's way, and reads
+  # the inventories back: that is what a fleet XML change breaks first.
   upstream-main:
     name: Against qemu-minimal main
     if: github.event_name != 'pull_request'
@@ -155,18 +198,17 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/checkout@v7
-        with:
-          repository: sbates130272/qemu-minimal
-          path: qemu-minimal
-
-      - name: Entry point and flavor lookup
-        run: tests/smoke.sh "$PWD/qemu-minimal/qemu"
-
-      - uses: ./
+      - name: install
+        id: install
+        uses: ./
         with:
           operation: install
-          qemu-tool-source: qemu-minimal/qemu
+          qemu-tool-ref: main
+
+      - name: Every fleet main ships renders, and the containers get main
+        env:
+          CHECKOUT: ${{ steps.install.outputs.qemu-tool-checkout }}
+        run: tests/smoke.sh "$CHECKOUT/qemu"
 
       - name: The flags `up` passes still exist
         run: |
@@ -186,12 +228,13 @@ jobs:
       - uses: actions/checkout@v7
 
       # One guest: four vCPUs is the RDMA driver's floor and a hosted runner
-      # has four cores.
+      # has four cores. Cut down by an overlay file, which is how a caller
+      # with a fleet change of their own would do it.
       - name: up
         id: fleet
         uses: ./
         with:
-          vm-count: 1
+          xml-overlay: examples/overlay-one-guest.xml
           wait-for: rdma
           copy: |
             tests:action-tests
@@ -228,8 +271,19 @@ jobs:
           [ "$COUNT" = 1 ]
           grep -q 1dd8 "$FETCHED/$NAMES/results/lspci.txt"
           ssh -F "$QEMU_TOOL_SSH_CONFIG" vm1 uname -r
+          [ "$NAMES" = ci-1 ]
           qemu-tool ssh "$NAMES" -- true
           qemu-tool compose ps
+
+      # The qemu-tool inside the stack's containers is the runner's, built
+      # from the tree the action placed, not a release pulled from PyPI.
+      - name: The containers run the runner's qemu-tool
+        run: |
+          set -eu
+          inside=$(docker exec ci-qemu-1-1 /tmp/qemu-tool-venv/bin/qemu-tool --version)
+          echo "runner: $(qemu-tool --version); container: $inside"
+          [ "$inside" = "$(qemu-tool --version)" ]
+          docker exec ci-qemu-1-1 test -d /qemu-tool-src/qemu/qemu_tool
 
       - name: exec
         uses: ./
@@ -277,6 +331,64 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: fleet-logs
+          path: ${{ steps.down.outputs.logs-dir }}
+          if-no-files-found: ignore
+
+  # A fleet XML of the caller's own, with qemu-tool pinned to a tag of
+  # qemu-minimal: the two things a downstream project is most likely to set.
+  boot-own:
+    name: Boot a fleet of your own, from a tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: up
+        id: fleet
+        uses: ./
+        with:
+          qemu-tool-ref: v2.1.0
+          stack-name: own
+          xml: examples/fleet-minimal.xml
+          xml-overlay: examples/overlay-one-guest.xml
+          wait-for: rdma
+          run: |
+            set -x
+            [ "$QT_VM_NAME" = ci-1 ]
+            [ "$QT_NIC_IPS" = "$QT_RDMA_IP" ]
+            ibv_devinfo -d "$QT_RDMA_DEVICE" | grep PORT_ACTIVE
+            test -e /dev/kfd
+            sudo nvme list | grep -c /dev/nvme
+
+      - name: It is that fleet, on that qemu-tool
+        env:
+          LAYERS: ${{ steps.fleet.outputs.fleet-xml }}
+          SHA: ${{ steps.fleet.outputs.qemu-tool-sha }}
+          MANIFEST: ${{ steps.fleet.outputs.vm-manifest }}
+        run: |
+          set -eu
+          [ "$(printf '%s\n' "$LAYERS" | wc -l)" = 2 ]
+          printf '%s\n' "$LAYERS" | head -n1 | grep -q 'examples/fleet-minimal.xml$'
+          [ "${#SHA}" = 40 ]
+          echo "$MANIFEST" | python3 -c '
+          import json, sys
+          m = json.load(sys.stdin)
+          assert len(m) == 1 and m[0]["gpu"] == "loaded" and len(m[0]["nics"]) == 1, m'
+          inside=$(docker exec own-qemu-1-1 /tmp/qemu-tool-venv/bin/qemu-tool --version)
+          [ "$inside" = "$(qemu-tool --version)" ]
+
+      - name: down
+        id: down
+        if: always() && steps.fleet.outputs.stack-dir != ''
+        uses: ./
+        with:
+          operation: down
+
+      - name: Upload logs
+        if: always() && steps.down.outputs.logs-dir != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: fleet-logs-own
           path: ${{ steps.down.outputs.logs-dir }}
           if-no-files-found: ignore
 

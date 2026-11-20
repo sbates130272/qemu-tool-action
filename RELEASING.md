@@ -51,19 +51,3 @@ GitHub only updates from the release's web page.
 
 Do not untick the Marketplace box on older releases: `@v1` users find
 v1.0.0 in the listing's version picker.
-
-## Once, for 2.0.0
-
-The repository's description, topics and homepage are settings, not files:
-
-```bash
-gh repo edit sbates130272/qemu-tool-action \
-  --description "GitHub Action that boots QEMU guests with emulated ROCm GPUs, RDMA NICs and NVMe in a CI job, runs your tests in them, and tears them down" \
-  --homepage "https://github.com/marketplace/actions/qemu-tool" \
-  --add-topic github-actions --add-topic actions --add-topic qemu --add-topic kvm \
-  --add-topic ci --add-topic testing --add-topic rocm --add-topic amd \
-  --add-topic gpu --add-topic rdma --add-topic nvme --add-topic vfio-user
-```
-
-Run it after 2.0.0 is released: until then `main` and the listing are v1,
-and the current description is the accurate one.

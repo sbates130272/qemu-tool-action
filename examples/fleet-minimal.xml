@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  A fleet of your own, as small as qemu-tool renders one: two guests, each
+  with one emulated GPU and one RDMA NIC, on an L2 network of their own.
+  Use it with the action's `xml` input, and copy it to start yours.
+
+  Every element is one qemu-tool documents in the fleet it ships,
+  qemu/stacks/rocm-golden.xml in the qemu-minimal repository. A fleet XML
+  is tied to the qemu-tool that reads it: an element a version does not
+  know is refused by name.
+-->
+<fleet xmlns="http://qemu-tool/fleet/1.0">
+
+  <vm-count>2</vm-count>
+  <vm-name-prefix>mine</vm-name-prefix>
+
+  <!-- The container images of QEMU and of the device servers. The three
+       are one build and have to stay one: QEMU and the servers speak
+       vfio-user to each other. These are the ones qemu-tool 2.1.0 ships. -->
+  <qemu-ref>docker.io/sbates130272/batesste-ci-images-ubuntu-qemu-libvfio-user-sbates-fork:20261112.gdca6903-qemu.4cb9698-vfu.3719c3a</qemu-ref>
+  <ernic-ref>docker.io/sbates130272/batesste-ci-images-ubuntu-rocm-ernic-sbates-fork:20261112.gdca6903-ernic.90434a2-vfu.3719c3a</ernic-ref>
+  <rocjitsu-ref>docker.io/sbates130272/batesste-ci-images-ubuntu-rocm-rocjitsu:20261112.gdca6903-rocjitsu.50be05a</rocjitsu-ref>
+
+  <!-- The guest image, pulled with oras. A fixed tag: one that moves, such
+       as "latest", is refused. An image published with `qemu-tool
+       publish-qcow` carries its own SSH key; for any other, give the
+       action ssh-key-file and ssh-user. -->
+  <backing-ref>docker.io/sbates130272/qemu-tool-rocm-golden:20261119.g2aea67d</backing-ref>
+
+  <!-- Devices per guest. At least one NIC and one GPU; the rest is optional. -->
+  <ernic-per-vm>1</ernic-per-vm>
+  <rocjitsu-per-vm>1</rocjitsu-per-vm>
+  <vm-nvme>1</vm-nvme>
+
+  <!-- No <vm-vcpus> or <vm-vmem>: the action sizes the guests from the
+       runner. Set them here and it leaves them as written. Four vCPUs is
+       the least the RDMA driver in the default guest image probes on. -->
+
+  <!-- Every guest is an overlay on one copy of the guest image. -->
+  <vm-backing-shared>true</vm-backing-shared>
+  <!-- The guests' L2 network; without it there is no RDMA between them. -->
+  <ernic-tap>true</ernic-tap>
+
+</fleet>
