@@ -1,87 +1,322 @@
 name: qemu-tool-action - CI
 
+# Also on a schedule and on push to main: the default qemu-tool version is a
+# range and the guest image it pulls moves, so the action can break with no
+# commit here.
 on:
   workflow_dispatch:
+    inputs:
+      two-guests:
+        description: Also boot two guests and run RDMA between them
+        type: boolean
+        default: false
   pull_request:
     branches:
       - main
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: '17 5 * * 1,4'
 
+permissions:
+  contents: read
+
+# Only a pull request's runs replace one another. Runs on main, the
+# scheduled one included, each get a group of their own, so none is dropped
+# from the queue by the next.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
 
   lint:
-    name: Lint
+    name: Lint and unit tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4.3.1
+      - uses: actions/checkout@v6
 
-      - name: shellcheck
-        run: shellcheck -S error scripts/*.sh
+      - name: Syntax
+        run: |
+          python3 -m py_compile qemu_tool_action.py
+          for f in launch.js main.js post.js; do node --check "$f"; done
+          shellcheck tests/*.sh scripts/*.sh
 
-      - name: Validate action.yml is parseable YAML
-        run: python3 -c "import yaml, sys; yaml.safe_load(open('action.yml'))" && echo "action.yml OK"
+      # Checks every `with:` key of the `uses: ./` steps below against
+      # action.yml, as well as the workflows themselves.
+      - name: actionlint
+        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:latest -color
 
-  dry-run:
-    name: Dry-run smoke test
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Entry point, without a runner
+        run: tests/smoke.sh
+
+      - name: Release logic, without a release
+        run: tests/test_release.sh
+
+  operations:
+    name: install and command
     runs-on: ubuntu-latest
     steps:
-      - name: Check out the action itself
-        uses: actions/checkout@v4.3.1
+      - uses: actions/checkout@v6
+
+      - name: Note the runner's python3
+        run: echo "PY_BEFORE=$(command -v python3)" >> "$GITHUB_ENV"
+
+      - name: install
+        id: install
+        uses: ./
         with:
-          path: qemu-tool-action
+          operation: install
 
-      - name: Check out qemu-minimal (source of qemu-tool)
-        uses: actions/checkout@v4.3.1
+      - name: Only qemu-tool and oras were added to PATH
+        env:
+          TOOL: ${{ steps.install.outputs.qemu-tool-path }}
+          VERSION: ${{ steps.install.outputs.qemu-tool-version }}
+        run: |
+          set -eu
+          [ "$(command -v qemu-tool)" = "$TOOL" ]
+          qemu-tool --version | grep -F "$VERSION"
+          [ "$(command -v python3)" = "$PY_BEFORE" ]
+          oras version
+          qemu-tool check || echo "::warning::qemu-tool check reported a failure"
+
+      - name: command
+        uses: ./
+        with:
+          operation: command
+          args: run-vm --vm-name ci-test --dry-run --no-kvm
+
+      - name: A v1 operation is refused
+        id: v1
+        continue-on-error: true
+        uses: ./
+        with:
+          operation: gen-vm
+
+      - name: It was refused
+        env:
+          OUTCOME: ${{ steps.v1.outcome }}
+        run: '[ "$OUTCOME" = failure ]'
+
+  # No guest: this is the root, no-sudo, no-docker path of install and of
+  # host setup, in an image the action knows nothing about.
+  container:
+    name: install and command, in a container job
+    runs-on: ubuntu-latest
+    container:
+      image: python:3.12-slim
+      options: >-
+        -v /var/lib/qemu-tool:/var/lib/qemu-tool
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Note the image's python3
+        run: echo "PY_BEFORE=$(command -v python3)" >> "$GITHUB_ENV"
+
+      - name: install
+        id: install
+        uses: ./
+        with:
+          operation: install
+
+      - name: Installed under the shared mount, python3 untouched
+        env:
+          TOOL: ${{ steps.install.outputs.qemu-tool-path }}
+        run: |
+          set -eu
+          [ "$(command -v qemu-tool)" = "$TOOL" ]
+          case "$TOOL" in
+            /var/lib/qemu-tool/*) ;;
+            *) echo "::error::installed outside the shared mount: $TOOL"; exit 1 ;;
+          esac
+          [ "$(command -v python3)" = "$PY_BEFORE" ]
+          qemu-tool --version
+          oras version
+          for t in qemu-img zstd ssh git ansible-playbook; do
+            command -v "$t"
+          done
+
+      - name: command
+        uses: ./
+        with:
+          operation: command
+          args: run-vm --vm-name ci-test --dry-run --no-kvm
+
+  # qemu-tool's unreleased main. Not on pull requests, so that a break
+  # upstream is seen here without blocking a change that did not cause it.
+  upstream-main:
+    name: Against qemu-minimal main
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/checkout@v6
         with:
           repository: sbates130272/qemu-minimal
           path: qemu-minimal
 
-      - name: run-vm dry-run via action
-        id: run_vm
-        uses: ./qemu-tool-action
-        with:
-          operation: run-vm
-          qemu-tool-source: ./qemu-minimal/qemu
-          vm-name: ci-test
-          ssh-port: '2222'
-          extra-args: --dry-run --no-kvm
+      - name: Entry point and flavor lookup
+        run: tests/smoke.sh "$PWD/qemu-minimal/qemu"
 
-      - name: Verify vm-manifest output
+      - uses: ./
+        with:
+          operation: install
+          qemu-tool-source: qemu-minimal/qemu
+
+      - name: The flags `up` passes still exist
         run: |
-          echo "Manifest: ${{ steps.run_vm.outputs.vm-manifest }}"
-          echo '${{ steps.run_vm.outputs.vm-manifest }}' | python3 -c "
+          set -eu
+          help=$(qemu-tool quick-start --help)
+          for f in --flavor --xml --stack-dir --key-dir --images --yes \
+                   --no-metrics --no-size-from-host --in-network --clean-overlays; do
+            printf '%s\n' "$help" | grep -q -- "$f" \
+              || { echo "::error::quick-start lost $f"; exit 1; }
+          done
+
+  boot:
+    name: Boot one guest
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+
+      # One guest: four vCPUs is the RDMA driver's floor and a hosted runner
+      # has four cores.
+      - name: up
+        id: fleet
+        uses: ./
+        with:
+          vm-count: 1
+          wait-for: rdma
+          copy: |
+            tests:action-tests
+          fetch: |
+            results
+          run: |
+            set -x
+            test -f smoke.sh
+            [ "$QT_VM_INDEX" = 1 ]
+            [ "$QT_VM_COUNT" = 1 ]
+            nproc
+            lspci -nn | grep 1dd8:1002
+            ibv_devinfo -d "$QT_RDMA_DEVICE" | grep PORT_ACTIVE
+            # The GPU, bound: a named node in the KFD topology.
+            test -e /dev/kfd
+            cat /sys/class/kfd/kfd/topology/nodes/*/name | grep .
+            mkdir -p ~/results
+            lspci -nn > ~/results/lspci.txt
+
+      - name: The outputs describe the guest
+        env:
+          MANIFEST: ${{ steps.fleet.outputs.vm-manifest }}
+          COUNT: ${{ steps.fleet.outputs.vm-count }}
+          NAMES: ${{ steps.fleet.outputs.vm-names }}
+          FETCHED: ${{ steps.fleet.outputs.fetch-dir }}
+        run: |
+          set -eu
+          echo "$MANIFEST" | python3 -c '
           import json, sys
           m = json.load(sys.stdin)
-          assert len(m) == 1, f'expected 1 entry, got: {m}'
-          assert m[0]['name'] == 'ci-test', m
-          assert m[0]['ssh_port'] == 2222, m
-          assert m[0]['image_path'] is None, m
-          print('vm-manifest OK')
-          "
+          assert len(m) == 1 and m[0]["rdma_device"], m
+          assert m[0]["gpu"] == "loaded", m
+          print(m[0]["ssh_cmd"])'
+          [ "$COUNT" = 1 ]
+          grep -q 1dd8 "$FETCHED/$NAMES/results/lspci.txt"
+          ssh -F "$QEMU_TOOL_SSH_CONFIG" vm1 uname -r
+          qemu-tool ssh "$NAMES" -- true
+          qemu-tool compose ps
 
-      - name: gen-vm dry-run via action (--dry-run in extra-args is not valid for gen-vm, use run-vm)
-        id: gen_vm
-        uses: ./qemu-tool-action
+      - name: exec
+        uses: ./
         with:
-          operation: run-vm
-          qemu-tool-source: ./qemu-minimal/qemu
-          vm-name: ci-gen-test
-          ssh-port: '2333'
-          arch: amd64
-          vcpus: '4'
-          vmem: '8192'
-          extra-args: --dry-run --no-kvm
+          operation: exec
+          run-on: first
+          env: |
+            GREETING=hello there
+          run: |
+            [ "$GREETING" = "hello there" ]
+            pwd | grep -q action-tests
 
-      - name: Verify gen-vm manifest shape
+      - name: A failing script fails the step
+        id: failing
+        continue-on-error: true
+        uses: ./
+        with:
+          operation: exec
+          run: |
+            touch ~/ran-before-exit
+            exit 3
+
+      - name: It failed, and for that reason
+        env:
+          OUTCOME: ${{ steps.failing.outcome }}
         run: |
-          echo "Manifest: ${{ steps.gen_vm.outputs.vm-manifest }}"
-          echo '${{ steps.gen_vm.outputs.vm-manifest }}' | python3 -c "
-          import json, sys
-          m = json.load(sys.stdin)
-          assert m[0]['name'] == 'ci-gen-test', m
-          assert m[0]['ssh_port'] == 2333, m
-          print('gen-vm manifest shape OK')
-          "
+          [ "$OUTCOME" = failure ]
+          ssh -F "$QEMU_TOOL_SSH_CONFIG" vm1 test -f ran-before-exit
+
+      - name: down
+        id: down
+        if: always() && steps.fleet.outputs.stack-dir != ''
+        uses: ./
+        with:
+          operation: down
+
+      - name: Nothing is left running
+        if: always()
+        run: |
+          left=$(docker ps -q --filter label=com.docker.compose.project=ci | wc -l)
+          [ "$left" -eq 0 ]
+
+      - name: Upload logs
+        if: always() && steps.down.outputs.logs-dir != ''
+        uses: actions/upload-artifact@v6
+        with:
+          name: fleet-logs
+          path: ${{ steps.down.outputs.logs-dir }}
+          if-no-files-found: ignore
+
+  # By hand only: two four-vCPU guests on a four-core runner are
+  # oversubscribed two to one, which the NIC mesh does not always survive.
+  boot-two:
+    name: Boot two guests (manual)
+    if: github.event_name == 'workflow_dispatch' && inputs.two-guests
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: up, and RDMA from the second guest to the first
+        uses: ./
+        with:
+          vm-count: 2
+          wait-for: rdma
+          run: |
+            [ "$QT_VM_COUNT" = 2 ]
+            [ -n "$QT_PEER_RDMA_IPS" ]
+            if [ "$QT_VM_INDEX" = 1 ]; then
+              ib_send_bw -d "$QT_RDMA_DEVICE" --iters 200
+            else
+              sleep 10
+              ib_send_bw -d "$QT_RDMA_DEVICE" --iters 200 "$QT_VM_1_RDMA_IP"
+            fi
+
+      - name: down
+        id: down
+        if: always()
+        continue-on-error: true
+        uses: ./
+        with:
+          operation: down
+
+      - name: Upload logs
+        if: always() && steps.down.outputs.logs-dir != ''
+        uses: actions/upload-artifact@v6
+        with:
+          name: fleet-logs-two
+          path: ${{ steps.down.outputs.logs-dir }}
+          if-no-files-found: ignore
