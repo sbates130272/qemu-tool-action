@@ -7,6 +7,13 @@ that follow the newest matching release.
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-11-20
+
+A fleet of your own becomes a documented, checked path; qemu-tool can be
+installed from a tag or commit of qemu-minimal; and the stack's containers
+run the same qemu-tool as the runner. Workflows written for 2.0.0 keep
+working; the entries under Changed are where behaviour differs.
+
 ### Added
 
 - `qemu-tool-ref`: install qemu-tool from a tag, a branch or a full commit
@@ -145,6 +152,7 @@ that stays on `@v1` has to set `qemu-tool-version` to a 1.x release. See
 Initial release: a composite action wrapping the `qemu-tool` 1.x `gen-vm`,
 `run-vm`, `compose` and `gen-compose` subcommands.
 
-[Unreleased]: https://github.com/sbates130272/qemu-tool-action/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/sbates130272/qemu-tool-action/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/sbates130272/qemu-tool-action/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/sbates130272/qemu-tool-action/compare/v1.0.0...v2.0.0
 [1.0.0]: https://github.com/sbates130272/qemu-tool-action/releases/tag/v1.0.0
