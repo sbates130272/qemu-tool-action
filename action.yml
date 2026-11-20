@@ -1,4 +1,5 @@
 name: qemu-tool
+author: Stephen Bates
 description: >-
   Boot QEMU guests with emulated ROCm GPUs, RDMA NICs and NVMe in a CI job,
   run commands in them, and tear them down.
@@ -38,7 +39,7 @@ inputs:
   setup-host:
     description: >-
       Make /dev/kvm usable by this user and install what is missing of oras,
-      qemu-utils, ansible-core, git and openssh-client. Set false on a
+      qemu-utils, zstd, ansible-core, git and openssh-client. Set false on a
       runner you have prepared yourself.
     required: false
     default: 'true'
@@ -93,6 +94,18 @@ inputs:
       than disks an earlier job left behind.
     required: false
     default: 'true'
+  gpu:
+    description: >-
+      Make each guest's emulated GPU usable: stage the firmware of the
+      rocjitsu serving it and load amdgpu with the emulation's parameters.
+      Without this the GPU is on the guest's PCI bus and nothing more. Set
+      false to do it yourself.
+    required: false
+    default: 'true'
+  gpu-generation:
+    description: GPU generation the firmware is generated for.
+    required: false
+    default: gfx1250
   wait-for:
     description: >-
       ssh (default): return once every guest answers SSH. rdma: also wait
@@ -132,11 +145,16 @@ inputs:
       absent, else a directory under RUNNER_TEMP.
     required: false
   stack-name:
-    description: Name of the stack, which is its compose project name.
+    description: >-
+      Name of the stack, which is its compose project name. Default ci. For
+      exec and down, which fleet of the job is meant; default, the one the
+      most recent up booted.
     required: false
-    default: ci
   stack-dir:
-    description: Where the stack is generated. Default <work-dir>/stacks/<stack-name>. Names the fleet for exec and down.
+    description: >-
+      Where the stack is generated. Default <work-dir>/stacks/<stack-name>;
+      its last component is then the stack name. Also names the fleet for
+      exec and down.
     required: false
   key-dir:
     description: Where the guest image's SSH keypair is pulled to. Default <work-dir>/keys/<stack-name>.
@@ -159,8 +177,15 @@ inputs:
       QT_RDMA_DEVICE, QT_PEER_RDMA_IPS and QT_VM_<n>_RDMA_IP. With several
       guests it runs on all of them at once.
     required: false
+  fetch:
+    description: >-
+      Files or directories to copy out of the guests after the script, one
+      `guest-path[:local-directory]` per line, whether the script passed or
+      not. Each guest's copy lands in <local-directory>/<guest-name>/;
+      the default directory is the fetch-dir output.
+    required: false
   run-on:
-    description: 'Guests copy and run apply to: all (default), first, last, or a list of guest names or indexes.'
+    description: 'Guests copy, run and fetch apply to: all (default), first, last, or a list of guest names or indexes.'
     required: false
     default: all
   working-directory:
@@ -179,7 +204,7 @@ outputs:
   vm-manifest:
     description: >-
       JSON array, one object per guest: name, index, ssh_host, ssh_port,
-      username, ssh_key_file, ssh_cmd, rdma_ip, rdma_ips, rdma_device.
+      username, ssh_key_file, ssh_cmd, rdma_ip, rdma_ips, rdma_device, gpu.
   vm-names:
     description: The guest names, space separated.
   vm-count:
@@ -200,6 +225,12 @@ outputs:
     description: Directory holding the guest images.
   logs-dir:
     description: Where container and guest logs are written at teardown.
+  fetch-dir:
+    description: Where `fetch` puts what it copies out, one directory per guest.
+  fleet-xml:
+    description: >-
+      The fleet XML layers the action passed to quick-start, one path per
+      line. Empty when the flavor's shipped file is used unchanged.
   qemu-tool-version:
     description: The qemu-tool version installed.
   qemu-tool-path:

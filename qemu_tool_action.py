@@ -22,7 +22,9 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
+import traceback
 import urllib.request
 import uuid
 from pathlib import Path
@@ -32,6 +34,9 @@ OPERATIONS = ("up", "install", "exec", "command", "down")
 NS_FLEET = "http://qemu-tool/fleet/1.0"
 DEFAULT_BASE = Path("/var/lib/qemu-tool")
 MIN_ORAS = (1, 3, 4)
+STACK_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+# Keepalives are explicit so a wedged guest is dropped after three minutes
+# on any OpenSSH, not only on Debian's, which turns them on under BatchMode.
 SSH_OPTS = [
     "-o", "StrictHostKeyChecking=no",
     "-o", "UserKnownHostsFile=/dev/null",
@@ -39,10 +44,15 @@ SSH_OPTS = [
     "-o", "BatchMode=yes",
     "-o", "IdentitiesOnly=yes",
     "-o", "ConnectTimeout=10",
+    "-o", "ServerAliveInterval=30",
+    "-o", "ServerAliveCountMax=6",
 ]
-# What quick-start's preflight insists on, and the apt package carrying each.
+# What qemu-tool needs on PATH to pull and boot a published guest, and the
+# apt package carrying each. zstd is not in quick-start's own preflight, and
+# the pull dies without it after that preflight has passed.
 APT_FOR_TOOL = {
     "qemu-img": "qemu-utils",
+    "zstd": "zstd",
     "ansible-playbook": "ansible-core",
     "git": "git",
     "ssh": "openssh-client",
@@ -76,6 +86,13 @@ def lines_of(name: str) -> list[str]:
             if line.strip() and not line.strip().startswith("#")]
 
 
+def whole_number(name: str, default: str) -> int:
+    value = inp(name, default)
+    if not value.isdigit():
+        raise Failure(f"input {name} must be a whole number, not {value!r}")
+    return int(value)
+
+
 def _append(env_var: str, text: str) -> None:
     path = os.environ.get(env_var)
     if path:
@@ -106,37 +123,63 @@ def add_path(directory: Path) -> None:
     _append("GITHUB_PATH", f"{directory}\n")
 
 
+def command_text(text: str) -> str:
+    """A message as a workflow command carries it: one line."""
+    return (str(text).replace("%", "%25").replace("\r", "%0D")
+            .replace("\n", "%0A"))
+
+
 def say(message: str) -> None:
     print(message, flush=True)
 
 
 def warn(message: str) -> None:
-    print(f"::warning::{message}", flush=True)
+    print(f"::warning::{command_text(message)}", flush=True)
 
 
 class group:
+    """A folded section of the log. Groups do not nest."""
+
     def __init__(self, title: str) -> None:
         self.title = title
 
     def __enter__(self) -> None:
-        print(f"::group::{self.title}", flush=True)
+        print(f"::group::{command_text(self.title)}", flush=True)
 
     def __exit__(self, *_exc: object) -> None:
         print("::endgroup::", flush=True)
 
 
-def run(cmd: list[str], check: bool = True, **kwargs) -> subprocess.CompletedProcess:
-    say(f"$ {shlex.join(str(c) for c in cmd)}")
-    result = subprocess.run([str(c) for c in cmd], **kwargs)
+def run(cmd: list, check: bool = True, **kwargs) -> subprocess.CompletedProcess:
+    argv = [str(c) for c in cmd]
+    say(f"$ {shlex.join(argv)}")
+    try:
+        result = subprocess.run(argv, **kwargs)
+    except FileNotFoundError:
+        raise Failure(f"{argv[0]} is not on PATH") from None
     if check and result.returncode != 0:
-        raise Failure(f"`{shlex.join(str(c) for c in cmd[:3])} ...` "
-                      f"exited {result.returncode}")
+        raise Failure(f"`{shlex.join(argv[:3])} ...` exited "
+                      f"{result.returncode}")
     return result
 
 
-def quiet(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
-    return subprocess.run([str(c) for c in cmd], capture_output=True,
-                          text=True, **kwargs)
+def quiet(cmd: list, **kwargs) -> subprocess.CompletedProcess:
+    """Run and capture. A missing program is exit 127, not an exception."""
+    argv = [str(c) for c in cmd]
+    try:
+        return subprocess.run(argv, capture_output=True, text=True,
+                              errors="replace", **kwargs)
+    except FileNotFoundError:
+        return subprocess.CompletedProcess(argv, 127, "",
+                                           f"{argv[0]} is not on PATH")
+
+
+def bounded(cmd: list, seconds: int, **kwargs) -> subprocess.CompletedProcess:
+    """quiet(), with a hung command counted as a failed one."""
+    try:
+        return quiet(cmd, timeout=seconds, **kwargs)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(cmd, 124, "", "timed out")
 
 
 def sudo() -> list[str] | None:
@@ -158,7 +201,31 @@ def _usable(directory: Path) -> bool:
     return directory.is_dir() and os.access(directory, os.W_OK | os.X_OK)
 
 
-def base_dir() -> Path:
+def mount_point(directory: Path, mountinfo: str) -> str:
+    """The mount point, from /proc/self/mountinfo text, a path lives on."""
+    target = str(directory)
+    best = "/"
+    for line in mountinfo.splitlines():
+        fields = line.split()
+        if len(fields) < 5:
+            continue
+        point = fields[4].replace("\\040", " ")
+        if (target == point or target.startswith(point.rstrip("/") + "/")) \
+                and len(point) > len(best):
+            best = point
+    return best
+
+
+def _shared_with_host(directory: Path) -> bool:
+    """In a container: is this on a mount, rather than the image's own disk?"""
+    try:
+        info = Path("/proc/self/mountinfo").read_text()
+    except OSError:
+        return False
+    return mount_point(directory.resolve(), info) != "/"
+
+
+def base_dir(operation: str) -> Path:
     """The root of everything this action writes.
 
     /var/lib/qemu-tool when it can be had, because a `container:` job has to
@@ -170,7 +237,22 @@ def base_dir() -> Path:
     if explicit:
         path = Path(explicit).expanduser().resolve()
         path.mkdir(parents=True, exist_ok=True)
+        if in_container() and (not _shared_with_host(path)
+                               or str(path).startswith(("/__w/", "/__t/"))):
+            warn(f"work-dir {path} may not be where the host has it. The "
+                 "stack's containers are started by the host's Docker "
+                 "daemon and only see it under a mount the host shares at "
+                 "the same path; the runner's workspace and temp "
+                 "directories are not at the same path.")
         return path
+    if in_container() and not _shared_with_host(DEFAULT_BASE):
+        message = (f"{DEFAULT_BASE} is not bind-mounted into this job "
+                   "container. Add `-v /var/lib/qemu-tool:/var/lib/qemu-tool` "
+                   "to container.options: the Docker daemon resolves the "
+                   "stack's bind mounts on the host.")
+        if operation == "up":
+            raise Failure(message)
+        warn(message)
     if _usable(DEFAULT_BASE):
         return DEFAULT_BASE
     if not DEFAULT_BASE.exists():
@@ -182,10 +264,7 @@ def base_dir() -> Path:
                 return DEFAULT_BASE
     fallback = Path(os.environ.get("RUNNER_TEMP") or "/tmp") / "qemu-tool"
     fallback.mkdir(parents=True, exist_ok=True)
-    if in_container():
-        warn(f"{DEFAULT_BASE} is not writable, using {fallback}. In a "
-             "container job the sibling containers will not see that path: "
-             f"bind-mount {DEFAULT_BASE} into the job container.")
+    say(f"{DEFAULT_BASE} is not writable, using {fallback}")
     return fallback
 
 
@@ -220,6 +299,20 @@ def tool_python(tool: str) -> str:
     return sys.executable
 
 
+def reusable(marker_text: str, stamp: str, asked: bool) -> bool:
+    """May this step use the install an earlier step of the job made?
+
+    Yes when it is the same job and the step either named no version of its
+    own or named the one already there. A step that only runs `exec` or
+    `down` must not reinstall under a running fleet.
+    """
+    if not stamp.split("\n")[0].strip(":"):
+        return False
+    if marker_text.split("\n")[0] != stamp.split("\n")[0]:
+        return False
+    return not asked or marker_text == stamp
+
+
 def install_qemu_tool(base: Path) -> dict[str, str]:
     if not flag("install", True):
         tool = shutil.which("qemu-tool")
@@ -230,29 +323,44 @@ def install_qemu_tool(base: Path) -> dict[str, str]:
             raise Failure("qemu-tool needs Python 3.10 or newer; this runner's "
                           f"python3 is {platform.python_version()}")
         spec = requirement()
+        asked = bool(inp("qemu-tool-version") or inp("qemu-tool-source"))
         venv = base / "action" / "venv"
-        # One install per job: a later step of the same job reuses it.
-        stamp = ":".join([os.environ.get("GITHUB_RUN_ID", ""),
-                          os.environ.get("GITHUB_RUN_ATTEMPT", ""),
-                          os.environ.get("GITHUB_JOB", ""), *spec])
+        job = ":".join(os.environ.get(key, "") for key in
+                       ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_JOB"))
+        stamp = job + "\n" + " ".join(spec)
         marker = venv / ".qemu-tool-action"
-        if (os.environ.get("GITHUB_RUN_ID") and marker.is_file()
-                and marker.read_text() == stamp
-                and (venv / "bin" / "qemu-tool").is_file()):
+        entry = venv / "bin" / "qemu-tool"
+        have = marker.read_text() if marker.is_file() else ""
+        if have and entry.is_file() and reusable(have, stamp, asked):
             say("reusing the install an earlier step of this job made")
-            bin_dir = venv / "bin"
         elif quiet([sys.executable, "-m", "venv", "--clear",
                     venv]).returncode == 0:
+            if have.split("\n")[0] == job and job.strip(":"):
+                warn("this step asks for a different qemu-tool than the one "
+                     "an earlier step of this job installed; reinstalling")
             run([venv / "bin" / "python", "-m", "pip", "install", "-q",
                  "--disable-pip-version-check", *spec])
             marker.write_text(stamp)
-            bin_dir = venv / "bin"
+        else:
+            entry = None
+        if entry is not None:
+            # Only the entry point goes on PATH. The venv's own bin holds a
+            # python3 and a pip that must not shadow the runner's.
+            bin_dir = base / "action" / "bin"
+            bin_dir.mkdir(parents=True, exist_ok=True)
+            link = bin_dir / "qemu-tool"
+            if link.is_symlink() or link.exists():
+                link.unlink()
+            link.symlink_to(entry)
         else:
             # No venv module (python3-venv missing). A user install still
             # lands ahead of an image's own copy once its bin is on PATH.
             say("python3 -m venv is unavailable; installing with pip --user")
-            run([sys.executable, "-m", "pip", "install", "-q", "--user",
-                 "--break-system-packages", *spec])
+            pip = [sys.executable, "-m", "pip", "install", "-q", "--user"]
+            if run(pip + ["--break-system-packages", *spec],
+                   check=False).returncode != 0:
+                # pip before 23.0.1 does not know the flag, and needs none.
+                run(pip + spec)
             bin_dir = Path.home() / ".local" / "bin"
         add_path(bin_dir)
         tool = str(bin_dir / "qemu-tool")
@@ -325,8 +433,13 @@ def setup_oras(base: Path) -> None:
     release = ("https://github.com/oras-project/oras/releases/download/"
                f"v{version}")
     name = f"oras_{version}_linux_{arch}.tar.gz"
-    archive = _fetch(f"{release}/{name}")
-    sums = _fetch(f"{release}/oras_{version}_checksums.txt").decode()
+    try:
+        archive = _fetch(f"{release}/{name}")
+        sums = _fetch(f"{release}/oras_{version}_checksums.txt").decode()
+    except OSError as exc:  # URLError, HTTPError and timeouts are all OSError
+        raise Failure(f"cannot download oras {version} ({exc}); install "
+                      "oras 1.3.4 or newer yourself and set setup-host: "
+                      "false") from None
     wanted = next((line.split()[0] for line in sums.splitlines()
                    if line.strip().endswith(name)), None)
     if wanted != hashlib.sha256(archive).hexdigest():
@@ -335,13 +448,16 @@ def setup_oras(base: Path) -> None:
     bin_dir.mkdir(parents=True, exist_ok=True)
     packed = bin_dir / name
     packed.write_bytes(archive)
-    with tarfile.open(packed) as tar:
-        member = tar.getmember("oras")
-        source = tar.extractfile(member)
-        if source is None:
-            raise Failure(f"{name} carries no oras binary")
-        (bin_dir / "oras").write_bytes(source.read())
-    packed.unlink()
+    try:
+        with tarfile.open(packed) as tar:
+            source = tar.extractfile(tar.getmember("oras"))
+            if source is None:
+                raise KeyError("oras")
+            (bin_dir / "oras").write_bytes(source.read())
+    except (KeyError, tarfile.TarError):
+        raise Failure(f"{name} carries no oras binary") from None
+    finally:
+        packed.unlink()
     (bin_dir / "oras").chmod(0o755)
     add_path(bin_dir)
 
@@ -355,12 +471,10 @@ def setup_host(base: Path) -> None:
         if root is None or shutil.which("apt-get") is None:
             warn(f"missing and not installable here: {', '.join(missing)}")
         else:
-            env = dict(os.environ, DEBIAN_FRONTEND="noninteractive")
-            run(root + ["env", "DEBIAN_FRONTEND=noninteractive",
-                        "apt-get", "update", "-q"], check=False, env=env)
-            run(root + ["env", "DEBIAN_FRONTEND=noninteractive", "apt-get",
-                        "install", "-y", "-q", "--no-install-recommends",
-                        *missing], env=env)
+            apt = root + ["env", "DEBIAN_FRONTEND=noninteractive", "apt-get"]
+            run(apt + ["update", "-q"], check=False)
+            run(apt + ["install", "-y", "-q", "--no-install-recommends",
+                       *missing])
     setup_oras(base)
     if shutil.which("docker") is None:
         warn("docker is not on PATH; the stacks need Docker with the "
@@ -383,16 +497,20 @@ def overlay_elements() -> dict[str, str]:
                 raise Failure(f"input {name} must be a positive whole "
                               f"number, not {value!r}")
             elements[element] = value
-    if "vm-vmem" in elements:
-        # Guest RAM is a shared memfd and must fit the container's shm.
-        elements["vm-shm-size"] = f"{int(elements['vm-vmem']) + 1024}m"
     for line in lines_of("fleet"):
         match = re.match(r"^([^:=\s]+)\s*[:=]\s*(.*)$", line)
         if not match or not _ELEMENT.match(match.group(1)):
             raise Failure(f"fleet: cannot read {line!r}; write one "
                           "`element: value` per line, e.g. `vm-nvme: 2`")
         elements[match.group(1)] = match.group(2).strip()
+    if elements.get("vm-vmem", "").isdigit() and "vm-shm-size" not in elements:
+        # Guest RAM is a shared memfd and must fit the container's shm.
+        elements["vm-shm-size"] = f"{int(elements['vm-vmem']) + 1024}m"
     return elements
+
+
+def sized_by_caller(elements: dict[str, str]) -> bool:
+    return bool({"vm-vcpus", "vm-vmem"} & set(elements))
 
 
 def render_overlay(elements: dict[str, str]) -> str:
@@ -416,14 +534,14 @@ def packaged_fleet(python: str, flavor: str) -> Path:
     return path
 
 
-def fleet_layers(python: str, flavor: str, action_dir: Path) -> list[str]:
+def fleet_layers(python: str, flavor: str, action_dir: Path,
+                 elements: dict[str, str]) -> list[str]:
     layers = []
     for entry in lines_of("xml"):
         path = Path(entry).expanduser().resolve()
         if not path.is_file():
             raise Failure(f"xml: {path} does not exist")
         layers.append(str(path))
-    elements = overlay_elements()
     if not elements:
         return layers
     if not layers:
@@ -439,6 +557,9 @@ def fleet_layers(python: str, flavor: str, action_dir: Path) -> list[str]:
 
 
 # ── The guests ───────────────────────────────────────────────────────────────
+
+_SHARED_KEYS = ("ansible_host", "ansible_user", "fleet_guest_rocjitsu_image")
+
 
 def parse_inventory(text: str) -> tuple[dict[str, str], list[dict]]:
     """The hosts of a gen-compose fleet-inventory.yml, without PyYAML."""
@@ -461,7 +582,7 @@ def parse_inventory(text: str) -> tuple[dict[str, str], list[dict]]:
             hosts_indent, current = indent, None
             continue
         if hosts_indent is None:
-            if key in ("ansible_host", "ansible_user") and value:
+            if key in _SHARED_KEYS and value:
                 shared[key] = value
             continue
         if indent == hosts_indent + 2:
@@ -475,11 +596,22 @@ def parse_inventory(text: str) -> tuple[dict[str, str], list[dict]]:
     return shared, hosts
 
 
+def read_inventory(state: dict) -> tuple[dict[str, str], list[dict]]:
+    inventory = Path(state["stack_dir"]) / "fleet-inventory.yml"
+    if not inventory.is_file():
+        raise Failure(f"{inventory} was not generated; the stack did not "
+                      "come up")
+    shared, hosts = parse_inventory(inventory.read_text())
+    if not hosts:
+        raise Failure(f"{inventory} names no guests")
+    return shared, hosts
+
+
 def image_username(key_dir: Path) -> str | None:
     try:
         return (json.loads((key_dir / "vm-info.json").read_text())
                 .get("username") or "").strip() or None
-    except (OSError, ValueError):
+    except (OSError, ValueError, AttributeError):
         return None
 
 
@@ -492,14 +624,8 @@ def container_ip(container: str) -> str | None:
 
 
 def build_manifest(state: dict) -> list[dict]:
-    stack_dir, key_dir = Path(state["stack_dir"]), Path(state["key_dir"])
-    inventory = stack_dir / "fleet-inventory.yml"
-    if not inventory.is_file():
-        raise Failure(f"{inventory} was not generated; the stack did not "
-                      "come up")
-    shared, hosts = parse_inventory(inventory.read_text())
-    if not hosts:
-        raise Failure(f"{inventory} names no guests")
+    key_dir = Path(state["key_dir"])
+    shared, hosts = read_inventory(state)
     username = image_username(key_dir) or shared.get("ansible_user", "ubuntu")
     key = key_dir / "id_rsa"
     manifest = []
@@ -527,6 +653,7 @@ def build_manifest(state: dict) -> list[dict]:
             "rdma_ip": ips[0] if ips else None,
             "rdma_ips": ips,
             "rdma_device": None,
+            "gpu": None,
         })
     return manifest
 
@@ -536,23 +663,30 @@ def ssh_base(vm: dict) -> list[str]:
             str(vm["ssh_port"]), f"{vm['username']}@{vm['ssh_host']}"]
 
 
+def show(title: str, cmd: list[str], seconds: int = 60) -> None:
+    """Print a diagnostic command's output under a heading. Never raises."""
+    say(f"--- {title}")
+    try:
+        subprocess.run(cmd, check=False, timeout=seconds)
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        say(f"(not available: {exc})")
+
+
 def wait_for_ssh(state: dict, manifest: list[dict], deadline: float) -> None:
     for vm in manifest:
         start = time.monotonic()
         while True:
-            if quiet(ssh_base(vm) + ["true"]).returncode == 0:
+            if bounded(ssh_base(vm) + ["true"], 60).returncode == 0:
                 say(f"  {vm['name']}: answering SSH at "
                     f"{vm['ssh_host']}:{vm['ssh_port']} "
                     f"({int(time.monotonic() - start)}s)")
                 break
             if time.monotonic() > deadline:
-                with group(f"{vm['name']}: last SSH attempt and container log"):
-                    subprocess.run(ssh_base(vm)[:1] + ["-v"] + ssh_base(vm)[1:]
-                                   + ["true"], check=False)
-                    subprocess.run(
-                        ["docker", "logs", "--tail", "80",
-                         f"{state['stack_name']}-qemu-{vm['index']}-1"],
-                        check=False)
+                show(f"{vm['name']}: last SSH attempt, verbose",
+                     ["ssh", "-v", *ssh_base(vm)[1:], "true"])
+                show(f"{vm['name']}: end of its container's log",
+                     ["docker", "logs", "--tail", "80",
+                      f"{state['stack_name']}-qemu-{vm['index']}-1"])
                 raise Failure(f"{vm['name']} never answered SSH at "
                               f"{vm['ssh_host']}:{vm['ssh_port']} as "
                               f"{vm['username']}")
@@ -571,7 +705,7 @@ echo "ADDRS=$(ip -4 -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | 
 def wait_for_rdma(manifest: list[dict], deadline: float) -> None:
     for vm in manifest:
         while True:
-            probe = quiet(ssh_base(vm) + ["bash -s"], input=_RDMA_PROBE)
+            probe = bounded(ssh_base(vm) + ["bash -s"], 90, input=_RDMA_PROBE)
             if probe.returncode == 0 and "DEV=" in probe.stdout:
                 found = dict(line.split("=", 1) for line
                              in probe.stdout.splitlines() if "=" in line)
@@ -584,15 +718,148 @@ def wait_for_rdma(manifest: list[dict], deadline: float) -> None:
                          f"{' '.join(addresses) or 'no IPv4 address'}")
                 break
             if time.monotonic() > deadline:
-                with group(f"{vm['name']}: RDMA state"):
-                    subprocess.run(ssh_base(vm) + [
-                        "uname -r; lsmod | grep -E '^ionic'; "
-                        "lspci -nn | grep -i 1dd8; ibv_devinfo; nproc"],
-                        check=False)
+                show(f"{vm['name']}: RDMA state", ssh_base(vm) + [
+                    "uname -r; lsmod | grep -E '^ionic'; "
+                    "lspci -nn | grep -i 1dd8; ibv_devinfo; nproc"])
                 raise Failure(f"{vm['name']} has no RDMA device with an "
                               "active port. ionic_rdma needs at least 4 "
                               "vCPUs in the guest.")
             time.sleep(5)
+
+
+# ── The emulated GPU ─────────────────────────────────────────────────────────
+#
+# A booted guest has the GPU on its PCI bus and nothing more: amdgpu is
+# blacklisted, and the one firmware file it needs to probe, ip_discovery.bin,
+# is not in the guest image because it belongs to the rocjitsu build serving
+# the device. qemu-tool's own `quick-start test` supplies both from an
+# Ansible play that needs a qemu-minimal checkout. What follows is that
+# play's firmware and probe steps (roles/rocjitsu_setup/tasks/firmware.yml in
+# its "live" form, then vm-quickstart.yml), without the checkout.
+
+_GPU_INSTALL = r"""
+set -euo pipefail
+stage=$(mktemp -d /tmp/qt-action-fw.XXXXXX)
+trap 'rm -rf "$stage" /tmp/qt-action-fw.tar' EXIT
+tar -xf /tmp/qt-action-fw.tar -C "$stage"
+test -s "$stage/ip_discovery.bin"
+base=/lib/firmware/amdgpu
+upd=/lib/firmware/updates/amdgpu
+sudo -n install -d -m 0755 "$base"
+for f in "$stage"/*.bin; do
+  n=$(basename "$f")
+  if [ "$n" = ip_discovery.bin ] || [ "$fwset" != gap ]; then
+    sudo -n install -o root -g root -m 0644 "$f" "$base/$n"
+  elif [ ! -e "$upd/$n" ] && [ ! -e "$upd/$n.xz" ]; then
+    sudo -n install -D -o root -g root -m 0644 "$f" "$upd/$n"
+  fi
+done
+sudo -n /usr/local/bin/amdgpu-probe || echo "amdgpu-probe exited $?" >&2
+for _ in $(seq 40); do
+  gpus=$(cat /sys/class/kfd/kfd/topology/nodes/*/name 2>/dev/null | grep -c . || true)
+  if [ "${gpus:-0}" -ge 1 ]; then
+    echo "${gpus} GPU node(s) in the KFD topology"
+    exit 0
+  fi
+  sleep 3
+done
+echo "No GPU in the KFD topology after 120 s: amdgpu did not bind one." >&2
+echo "amdgpu-probe --status: $(/usr/local/bin/amdgpu-probe --status 2>&1 || true)" >&2
+sudo -n dmesg | grep -i amdgpu | tail -n 40 >&2 || true
+exit 1
+"""
+
+
+def gpu_status(vm: dict) -> str:
+    """amdgpu-probe's one word, or "unknown" for a guest without the script."""
+    # A wrapper from before --status takes the argument for a plain run and
+    # would load amdgpu with no firmware staged.
+    asked = bounded(ssh_base(vm) + [
+        "grep -q -- --status /usr/local/bin/amdgpu-probe 2>/dev/null "
+        "&& /usr/local/bin/amdgpu-probe --status || echo unknown"], 60)
+    words = asked.stdout.split()
+    return words[-1] if asked.returncode == 0 and words else "unknown"
+
+
+# The blobs a guest's driver package ships. A guest that has them needs only
+# the gap around them; one that does not needs the full set.
+_FIRMWARE_SET = r"""
+for n in gc_12_1_0_mec.bin gc_12_1_0_mec_1.bin gc_12_1_0_rlc.bin \
+         gc_12_1_0_rlc_1.bin gc_12_1_0_uni_mes.bin sdma_7_1_0.bin; do
+  [ -e "/lib/firmware/updates/amdgpu/$n" ] || { echo full; exit 0; }
+done
+echo gap
+"""
+
+
+def firmware_set(vm: dict) -> str:
+    asked = bounded(ssh_base(vm) + ["bash -s"], 60, input=_FIRMWARE_SET)
+    return "full" if asked.stdout.strip() == "full" else "gap"
+
+
+def generate_firmware(image: str, generation: str, fwset: str,
+                      target: Path) -> None:
+    """The firmware set of this stack's rocjitsu, as a tar on the runner."""
+    script = ("python3 /usr/local/bin/vfio_guest_firmware.py "
+              f"--generation {shlex.quote(generation)} --set {fwset} "
+              "--output /out >&2 && tar -cf - -C /out .")
+    say(f"generating {generation} firmware ({fwset}) with {image}")
+    with open(target, "wb") as out:
+        made = subprocess.run(["docker", "run", "--rm", "--entrypoint",
+                               "/bin/sh", image, "-c", script], stdout=out)
+    if made.returncode != 0 or target.stat().st_size == 0:
+        raise Failure("could not generate the GPU firmware from the "
+                      f"rocjitsu image {image}")
+
+
+def bring_up_gpu(vm: dict, firmware: Path, fwset: str) -> None:
+    with open(firmware, "rb") as blob:
+        sent = subprocess.run(ssh_base(vm) + ["cat > /tmp/qt-action-fw.tar"],
+                              stdin=blob, capture_output=True)
+    if sent.returncode != 0:
+        raise Failure(f"{vm['name']}: could not copy the GPU firmware in")
+    done = quiet(ssh_base(vm) + ["bash -s"],
+                 input=f"fwset={fwset}\n{_GPU_INSTALL}", timeout=600)
+    say(f"  {vm['name']}: {(done.stdout.strip().splitlines() or ['no GPU'])[-1]}")
+    if done.returncode != 0:
+        say(done.stderr)
+        raise Failure(f"{vm['name']}: amdgpu did not bind the emulated GPU")
+
+
+def setup_gpus(state: dict, manifest: list[dict]) -> None:
+    """Make each guest's emulated GPU usable, where it has one."""
+    pending = []
+    for vm in manifest:
+        vm["gpu"] = gpu_status(vm)
+        if vm["gpu"] in ("nofirmware", "ready", "unbound"):
+            pending.append(vm)
+        elif vm["gpu"] == "stranded":
+            raise Failure(f"{vm['name']}: amdgpu is loaded with parameters "
+                          "other than the emulation's; only a reboot of the "
+                          "guest clears that")
+        else:
+            say(f"  {vm['name']}: GPU {vm['gpu']}, nothing to do")
+    if not pending:
+        return
+    shared, _hosts = read_inventory(state)
+    image = shared.get("fleet_guest_rocjitsu_image")
+    if not image:
+        raise Failure("the generated fleet-inventory.yml names no rocjitsu "
+                      "image to take the GPU firmware from; set gpu: false "
+                      "and stage it yourself")
+    sets = {vm["name"]: firmware_set(vm) for vm in pending}
+    tars = {}
+    for fwset in sorted(set(sets.values())):
+        tars[fwset] = (Path(state["state_file"]).parent
+                       / f"gpu-firmware-{fwset}.tar")
+        generate_firmware(image, inp("gpu-generation", "gfx1250"), fwset,
+                          tars[fwset])
+    with concurrent.futures.ThreadPoolExecutor(len(pending)) as pool:
+        jobs = [(vm, pool.submit(bring_up_gpu, vm, tars[sets[vm["name"]]],
+                                 sets[vm["name"]])) for vm in pending]
+        for vm, job in jobs:
+            job.result()
+            vm["gpu"] = gpu_status(vm)
 
 
 def write_ssh_config(manifest: list[dict], path: Path) -> None:
@@ -607,7 +874,9 @@ def write_ssh_config(manifest: list[dict], path: Path) -> None:
             "  IdentitiesOnly yes\n"
             "  StrictHostKeyChecking no\n"
             "  UserKnownHostsFile /dev/null\n"
-            "  LogLevel ERROR\n")
+            "  LogLevel ERROR\n"
+            "  ServerAliveInterval 30\n"
+            "  ServerAliveCountMax 6\n")
     path.write_text("\n".join(entries))
     path.chmod(0o600)
 
@@ -638,18 +907,20 @@ def select(manifest: list[dict], spec: str) -> list[dict]:
         return manifest[:1]
     if spec == "last":
         return manifest[-1:]
-    chosen = []
-    for token in re.split(r"[,\s]+", spec):
+    chosen: list[dict] = []
+    for token in filter(None, re.split(r"[,\s]+", spec)):
         hit = [vm for vm in manifest
                if token in (vm["name"], str(vm["index"]))]
         if not hit:
             raise Failure(f"run-on: no guest {token!r}; there are "
                           f"{', '.join(vm['name'] for vm in manifest)}")
         chosen += [vm for vm in hit if vm not in chosen]
+    if not chosen:
+        raise Failure("run-on names no guest")
     return chosen
 
 
-# ── Copying into the guests and running there ────────────────────────────────
+# ── Copying into the guests, running there, copying out ──────────────────────
 
 def remote_path(path: str) -> str:
     """Quoted for the guest's shell; ~/ means its home, which is the cwd."""
@@ -679,7 +950,7 @@ def copy_into(vm: dict, source: Path, destination: str) -> None:
     unpack = ssh_base(vm) + [f"mkdir -p {where} && tar -C {where} -xf -"]
     packer = subprocess.Popen(pack, stdout=subprocess.PIPE)
     received = subprocess.run(unpack, stdin=packer.stdout,
-                              capture_output=True, text=True)
+                              capture_output=True, text=True, errors="replace")
     packer.stdout.close()  # type: ignore[union-attr]
     if packer.wait() != 0 or received.returncode != 0:
         raise Failure(f"copying {source} to {vm['name']}:{destination} "
@@ -699,6 +970,65 @@ def copy_all(manifest: list[dict], entries: list[str]) -> str | None:
     return next((dest for source, dest in pairs if source.is_dir()), None)
 
 
+def parse_fetch(entry: str, default_dir: Path) -> tuple[str, Path]:
+    path, _, local = entry.partition(":")
+    if not path.strip():
+        raise Failure(f"fetch: cannot read {entry!r}; write "
+                      "`guest-path[:local-directory]`")
+    return path.strip(), (Path(local.strip()).expanduser().resolve()
+                          if local.strip() else default_dir)
+
+
+def fetch_from(vm: dict, path: str, local: Path) -> bool:
+    """Copy a file or directory out of one guest, under <local>/<guest>/."""
+    where = remote_path(path)
+    pack = ssh_base(vm) + [
+        f"p={where}; [ -e \"$p\" ] || exit 44; "
+        "tar -C \"$(dirname \"$p\")\" -cf - \"$(basename \"$p\")\""]
+    target = local / vm["name"]
+    target.mkdir(parents=True, exist_ok=True)
+    # ssh's stderr goes to a file: a pipe nobody reads while tar runs would
+    # fill, and a remote tar reporting many errors would then never finish.
+    with tempfile.TemporaryFile() as errors:
+        sender = subprocess.Popen(pack, stdout=subprocess.PIPE, stderr=errors)
+        unpacked = subprocess.run(["tar", "-C", str(target), "-xf", "-"],
+                                  stdin=sender.stdout, capture_output=True)
+        sender.stdout.close()  # type: ignore[union-attr]
+        code = sender.wait()
+        errors.seek(0)
+        stderr = errors.read().decode(errors="replace")
+    if code == 44:
+        warn(f"fetch: {vm['name']} has no {path}")
+        return False
+    if code != 0 or unpacked.returncode != 0:
+        warn(f"fetch: copying {path} out of {vm['name']} failed: "
+             f"{stderr.strip()[-300:]}")
+        return False
+    say(f"  {vm['name']}:{path} -> {target}")
+    return True
+
+
+def fetch_all(targets: list[dict], default_dir: Path) -> None:
+    """Best effort: what a failed run left behind is what is wanted most."""
+    for entry in lines_of("fetch"):
+        path, local = parse_fetch(entry, default_dir)
+        for vm in targets:
+            try:
+                fetch_from(vm, path, local)
+            except OSError as exc:
+                warn(f"fetch: {vm['name']}: {exc}")
+
+
+def parse_env() -> dict[str, str]:
+    env = {}
+    for line in lines_of("env"):
+        key, sep, value = line.partition("=")
+        if not sep or not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", key.strip()):
+            raise Failure(f"env: cannot read {line!r}; write KEY=VALUE")
+        env[key.strip()] = value
+    return env
+
+
 def guest_env(vm: dict, manifest: list[dict]) -> dict[str, str]:
     env = {
         "QT_VM_NAME": vm["name"],
@@ -714,11 +1044,7 @@ def guest_env(vm: dict, manifest: list[dict]) -> dict[str, str]:
     for peer in manifest:
         env[f"QT_VM_{peer['index']}_NAME"] = peer["name"]
         env[f"QT_VM_{peer['index']}_RDMA_IP"] = peer["rdma_ip"] or ""
-    for line in lines_of("env"):
-        key, sep, value = line.partition("=")
-        if not sep or not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", key.strip()):
-            raise Failure(f"env: cannot read {line!r}; write KEY=VALUE")
-        env[key.strip()] = value
+    env.update(parse_env())
     return env
 
 
@@ -733,7 +1059,7 @@ def guest_script(vm: dict, manifest: list[dict], script: str,
 
 # The script goes to a file rather than to bash's stdin, so a command in it
 # that reads stdin does not eat the rest of the script. A login shell, so
-# /etc/profile.d (where the guest image puts ROCm on PATH) applies.
+# the guest's profile applies.
 _REMOTE_RUNNER = ('f=$(mktemp /tmp/qt-action.XXXXXX) && cat > "$f" && '
                   'bash -leo pipefail "$f" < /dev/null; rc=$?; '
                   'rm -f "$f"; exit $rc')
@@ -745,6 +1071,7 @@ def run_script(manifest: list[dict], targets: list[dict], script: str,
         return subprocess.run(
             ssh_base(vm) + [_REMOTE_RUNNER],
             input=guest_script(vm, manifest, script, workdir), text=True,
+            encoding="utf-8", errors="replace",
             stdout=subprocess.PIPE if capture else None,
             stderr=subprocess.STDOUT if capture else None)
 
@@ -754,11 +1081,17 @@ def run_script(manifest: list[dict], targets: list[dict], script: str,
             if one(targets[0], False).returncode != 0:
                 failed.append(targets[0]["name"])
     else:
-        say(f"running on {len(targets)} guests in parallel")
+        say(f"running on {len(targets)} guests in parallel; each guest's "
+            "output is printed when all have finished")
         with concurrent.futures.ThreadPoolExecutor(len(targets)) as pool:
             jobs = [(vm, pool.submit(one, vm, True)) for vm in targets]
             for vm, job in jobs:
-                done = job.result()
+                try:
+                    done = job.result()
+                except Exception as exc:  # noqa: BLE001 - keep the others
+                    warn(f"{vm['name']}: {exc}")
+                    failed.append(vm["name"])
+                    continue
                 with group(f"run on {vm['name']} (exit {done.returncode})"):
                     sys.stdout.write(done.stdout or "")
                     sys.stdout.flush()
@@ -766,6 +1099,27 @@ def run_script(manifest: list[dict], targets: list[dict], script: str,
                     failed.append(vm["name"])
     if failed:
         raise Failure(f"the run script failed on {', '.join(failed)}")
+
+
+def validate_guest_inputs() -> str:
+    """Refuse what can be refused before a fleet is booted for it."""
+    wait_for = inp("wait-for", "ssh").lower()
+    if wait_for not in ("ssh", "rdma", "none"):
+        raise Failure(f"wait-for must be ssh, rdma or none, not {wait_for!r}")
+    whole_number("wait-timeout", "900")
+    whole_number("log-lines", "40")
+    for entry in lines_of("copy"):
+        parse_copy(entry)
+    for entry in lines_of("fetch"):
+        parse_fetch(entry, Path("."))
+    parse_env()
+    wants_guest = [name for name in ("copy", "fetch") if lines_of(name)]
+    if os.environ.get("INPUT_RUN", "").strip():
+        wants_guest.append("run")
+    if wants_guest and wait_for == "none":
+        raise Failure(f"{' and '.join(wants_guest)} need the guests "
+                      "reachable; that cannot be combined with wait-for: none")
+    return wait_for
 
 
 # ── State shared with later steps and with the post step ─────────────────────
@@ -781,19 +1135,41 @@ def write_state(state: dict) -> None:
 
 
 def load_state() -> dict:
+    """The fleet an `exec` or `down` step means.
+
+    The one its stack-dir or stack-name input names; with neither, the one
+    the job's most recent `up` booted. A named fleet that is not found is an
+    error, never a reason to act on another.
+    """
     explicit = inp("stack-dir")
-    candidates = []
-    if explicit:
-        stack_dir = Path(explicit).expanduser().resolve()
-        candidates += [root / "action" / stack_dir.name / "state.json"
-                       for root in (stack_dir.parent.parent, DEFAULT_BASE)]
-    if os.environ.get("QEMU_TOOL_ACTION_STATE"):
-        candidates.append(Path(os.environ["QEMU_TOOL_ACTION_STATE"]))
-    for candidate in candidates:
-        if candidate.is_file():
-            return json.loads(candidate.read_text())
-    raise Failure("no fleet from an earlier `operation: up` step was found "
-                  "in this job")
+    ambient = os.environ.get("QEMU_TOOL_ACTION_STATE")
+    stack_dir = Path(explicit).expanduser().resolve() if explicit else None
+    named = stack_dir.name if stack_dir else inp("stack-name")
+    if not named:
+        if ambient and Path(ambient).is_file():
+            return json.loads(Path(ambient).read_text())
+        raise Failure("no fleet from an earlier `operation: up` step was "
+                      "found in this job")
+    roots = [DEFAULT_BASE,
+             Path(os.environ.get("RUNNER_TEMP") or "/tmp") / "qemu-tool"]
+    if ambient:
+        roots.insert(0, Path(ambient).parent.parent.parent)
+    if inp("work-dir"):
+        roots.insert(0, Path(inp("work-dir")).expanduser().resolve())
+    if stack_dir:
+        roots.insert(0, stack_dir.parent.parent)
+    for root in roots:
+        candidate = root / "action" / named / "state.json"
+        if not candidate.is_file():
+            continue
+        state = json.loads(candidate.read_text())
+        if state.get("stack_name") != named:
+            continue
+        if stack_dir and Path(state.get("stack_dir", "")) != stack_dir:
+            continue
+        return state
+    raise Failure(f"no fleet named {named!r} from an earlier `operation: up` "
+                  "step was found in this job")
 
 
 def publish(state: dict, manifest: list[dict]) -> None:
@@ -815,14 +1191,15 @@ def publish(state: dict, manifest: list[dict]) -> None:
 def summarise(state: dict, manifest: list[dict], seconds: float) -> None:
     rows = "".join(
         f"| `{vm['name']}` | `{vm['ssh_host']}:{vm['ssh_port']}` | "
-        f"`{vm['username']}` | {vm['rdma_device'] or ''} | "
-        f"{vm['rdma_ip'] or ''} |\n" for vm in manifest)
+        f"`{vm['username']}` | {vm['gpu'] or ''} | "
+        f"{vm['rdma_device'] or ''} | {vm['rdma_ip'] or ''} |\n"
+        for vm in manifest)
     _append("GITHUB_STEP_SUMMARY",
             f"### qemu-tool fleet `{state['stack_name']}`\n\n"
             f"{len(manifest)} guest(s) up in {int(seconds)}s with qemu-tool "
             f"{state['version']}.\n\n"
-            "| Guest | SSH | User | RDMA device | RDMA address |\n"
-            "|---|---|---|---|---|\n" + rows + "\n")
+            "| Guest | SSH | User | GPU | RDMA device | RDMA address |\n"
+            "|---|---|---|---|---|---|\n" + rows + "\n")
 
 
 # ── Operations ───────────────────────────────────────────────────────────────
@@ -838,13 +1215,20 @@ def op_install(base: Path) -> dict[str, str]:
 
 def op_up(base: Path) -> None:
     started = time.monotonic()
-    tool = op_install(base)
-    stack = inp("stack-name", "ci")
-    if not re.match(r"^[a-z0-9][a-z0-9_-]*$", stack):
-        raise Failure(f"stack-name {stack!r} must be lowercase letters, "
-                      "digits, - and _ (it is the compose project name)")
-    stack_dir = Path(inp("stack-dir") or base / "stacks" / stack).expanduser().resolve()
+    wait_for = validate_guest_inputs()
+    want_gpu = flag("gpu", True)
+    stack_dir = Path(inp("stack-dir")
+                     or base / "stacks" / inp("stack-name", "ci")
+                     ).expanduser().resolve()
     stack = stack_dir.name
+    if not STACK_NAME.match(stack):
+        raise Failure(f"the stack's name {stack!r} must be lowercase "
+                      "letters, digits, - and _ (it is the compose project "
+                      "name)")
+    elements = overlay_elements()
+    host_sizing = flag("size-from-host", True) and not sized_by_caller(elements)
+    extra = shlex.split(inp("extra-args"))
+    tool = op_install(base)
     state = {
         "state_file": str(state_path(base, stack)),
         "stack_name": stack,
@@ -854,6 +1238,7 @@ def op_up(base: Path) -> None:
         "images_dir": str(Path(inp("images-dir") or base / "images")
                           .expanduser().resolve()),
         "logs_dir": str(base / "action" / stack / "logs"),
+        "fetch_dir": str(base / "action" / stack / "fetched"),
         "tool": tool["tool"],
         "version": tool["version"],
         "flavor": inp("flavor", "default"),
@@ -867,7 +1252,7 @@ def op_up(base: Path) -> None:
     Path(state["images_dir"]).mkdir(parents=True, exist_ok=True)
     with group("Fleet settings"):
         state["layers"] = fleet_layers(tool["python"], state["flavor"],
-                                       action_dir)
+                                       action_dir, elements)
         say("layers: " + (" + ".join(state["layers"])
                           or f"the {state['flavor']} flavor as shipped"))
     # Recorded before anything starts, so the post step can clear up a stack
@@ -876,9 +1261,11 @@ def op_up(base: Path) -> None:
     save_state("state_file", state["state_file"])
     export_env("QEMU_TOOL_ACTION_STATE", state["state_file"])
     export_env("QEMU_TOOL_STACK", state["stack_dir"])
-    for key in ("stack-dir", "stack-name", "key-dir", "images-dir", "logs-dir"):
+    for key in ("stack-dir", "stack-name", "key-dir", "images-dir",
+                "logs-dir", "fetch-dir"):
         set_output(key, state[key.replace("-", "_")])
     set_output("key-file", str(Path(state["key_dir"]) / "id_rsa"))
+    set_output("fleet-xml", "\n".join(state["layers"]))
 
     command = [tool["tool"], "quick-start", "up", "--flavor", state["flavor"]]
     for layer in state["layers"]:
@@ -887,13 +1274,17 @@ def op_up(base: Path) -> None:
                 state["key_dir"], "--images", state["images_dir"], "--yes"]
     if not flag("metrics"):
         command.append("--no-metrics")
-    if inp("vcpus") or inp("vmem") or not flag("size-from-host", True):
+    if not host_sizing:
         command.append("--no-size-from-host")
+        # quick-start re-reads every overlay it ever generated in this
+        # directory, whatever the flag says; an earlier host-sized run's
+        # would outrank the sizes asked for now.
+        (stack_dir / "overlay-sized.xml").unlink(missing_ok=True)
     if state["in_network"]:
         command.append("--in-network")
     if flag("clean-overlays", True):
         command.append("--clean-overlays")
-    command += shlex.split(inp("extra-args"))
+    command += extra
     with group("Boot the fleet"):
         subprocess.run(["df", "-h", state["images_dir"]], check=False)
         run(command)
@@ -908,30 +1299,29 @@ def op_up(base: Path) -> None:
             write_state(state)
 
     manifest = build_manifest(state)
-    wait_for = inp("wait-for", "ssh")
-    if wait_for not in ("ssh", "rdma", "none"):
-        raise Failure(f"wait-for must be ssh, rdma or none, not {wait_for!r}")
-    deadline = time.monotonic() + int(inp("wait-timeout", "900"))
+    deadline = time.monotonic() + whole_number("wait-timeout", "900")
     if wait_for != "none":
         with group("Wait for the guests"):
             wait_for_ssh(state, manifest, deadline)
             if wait_for == "rdma":
                 wait_for_rdma(manifest, deadline)
+        if want_gpu:
+            with group("Bring up the emulated GPUs"):
+                setup_gpus(state, manifest)
+    elif want_gpu:
+        say("wait-for: none, so the emulated GPUs are left unprobed")
     publish(state, manifest)
     summarise(state, manifest, time.monotonic() - started)
     for vm in manifest:
         say(f"{vm['name']}: {vm['ssh_cmd']}")
-    after_up(state, manifest)
+    in_guests(state, manifest)
 
 
-def after_up(state: dict, manifest: list[dict]) -> None:
-    """The copy and run inputs, for `up` and for `exec` alike."""
+def in_guests(state: dict, manifest: list[dict]) -> None:
+    """The copy, run and fetch inputs, for `up` and for `exec` alike."""
     targets = select(manifest, inp("run-on", "all"))
     workdir = inp("working-directory") or state.get("workdir")
     if lines_of("copy"):
-        if inp("wait-for", "ssh") == "none":
-            raise Failure("copy needs the guests reachable; it cannot be "
-                          "combined with wait-for: none")
         with group("Copy into the guests"):
             copied = copy_all(targets, lines_of("copy"))
         if copied and not inp("working-directory"):
@@ -939,17 +1329,26 @@ def after_up(state: dict, manifest: list[dict]) -> None:
             state["workdir"] = copied
             write_state(state)
     script = os.environ.get("INPUT_RUN", "")
-    if script.strip():
-        run_script(manifest, targets, script, workdir)
+    try:
+        if script.strip():
+            run_script(manifest, targets, script, workdir)
+    finally:
+        if lines_of("fetch"):
+            with group("Copy out of the guests"):
+                fetch_all(targets, Path(state["fetch_dir"]))
 
 
 def op_exec() -> None:
+    validate_guest_inputs()
     state = load_state()
     if not state.get("manifest"):
         raise Failure("the fleet of this job never finished coming up")
-    if not lines_of("copy") and not os.environ.get("INPUT_RUN", "").strip():
-        raise Failure("operation: exec needs a `run` script or `copy` entries")
-    after_up(state, state["manifest"])
+    if not (lines_of("copy") or lines_of("fetch")
+            or os.environ.get("INPUT_RUN", "").strip()):
+        raise Failure("operation: exec needs a `run` script, or `copy` or "
+                      "`fetch` entries")
+    set_output("fetch-dir", state.get("fetch_dir", ""))
+    in_guests(state, state["manifest"])
 
 
 def op_command(base: Path) -> None:
@@ -958,18 +1357,19 @@ def op_command(base: Path) -> None:
         raise Failure("operation: command needs `args`, the qemu-tool command "
                       "line without its first word, e.g. "
                       "`gen-compose --xml fleet.xml --check`")
-    tool = shutil.which("qemu-tool") if not flag("install", True) else None
-    if tool is None:
-        tool = op_install(base)["tool"]
+    tool = op_install(base)["tool"]
     result = run([tool, *arguments], check=False)
     if result.returncode != 0:
         raise Failure(f"qemu-tool {arguments[0]} exited {result.returncode}")
 
 
-def project_containers(stack: str, running_only: bool = False) -> list[str]:
-    command = ["docker", "ps", "-q" if running_only else "-aq", "--filter",
-               f"label=com.docker.compose.project={stack}"]
-    return quiet(command).stdout.split()
+def labelled(kind: list[str], stack: str) -> list[str]:
+    return quiet(["docker", *kind, "--filter",
+                  f"label=com.docker.compose.project={stack}"]).stdout.split()
+
+
+def project_containers(stack: str) -> list[str]:
+    return labelled(["ps", "-aq"], stack)
 
 
 def collect_logs(state: dict, tail: int) -> None:
@@ -979,19 +1379,19 @@ def collect_logs(state: dict, tail: int) -> None:
                      f"label=com.docker.compose.project={state['stack_name']}"])
     (logs / "docker-ps.txt").write_text(listing.stdout)
     for vm in state.get("manifest", []):
-        try:
-            got = quiet(ssh_base(vm) + ["sudo -n dmesg | tail -n 500"],
-                        timeout=30)
-        except subprocess.TimeoutExpired:
-            continue
+        got = bounded(ssh_base(vm) + ["sudo -n dmesg | tail -n 500"], 30)
         if got.returncode == 0:
             (logs / f"guest-{vm['name']}-dmesg.log").write_text(got.stdout)
     for container in project_containers(state["stack_name"]):
-        name = quiet(["docker", "inspect", "-f", "{{.Name}}",
-                      container]).stdout.strip().lstrip("/") or container
-        text = quiet(["docker", "logs", "--timestamps", container])
-        body = text.stdout + text.stderr
-        (logs / f"{name}.log").write_text(body)
+        try:
+            name = quiet(["docker", "inspect", "-f", "{{.Name}}",
+                          container]).stdout.strip().lstrip("/") or container
+            text = quiet(["docker", "logs", "--timestamps", container])
+            body = text.stdout + text.stderr
+            (logs / f"{name}.log").write_text(body)
+        except OSError as exc:
+            warn(f"log of container {container}: {exc}")
+            continue
         if tail > 0:
             with group(f"{name}: last {tail} lines"):
                 say("\n".join(body.splitlines()[-tail:]))
@@ -1003,8 +1403,11 @@ def teardown(state: dict) -> None:
     if not project_containers(stack):
         say(f"stack {stack}: nothing running, nothing to tear down")
         return
-    with group(f"Collect logs of stack {stack}"):
-        collect_logs(state, int(inp("log-lines", "40")))
+    try:
+        lines = inp("log-lines", "40")
+        collect_logs(state, int(lines) if lines.isdigit() else 40)
+    except Exception as exc:  # noqa: BLE001 - logs must never block teardown
+        warn(f"collecting the logs of stack {stack} failed: {exc}")
     with group(f"Tear down stack {stack}"):
         if state.get("joined"):
             quiet(["docker", "network", "disconnect", "-f",
@@ -1018,11 +1421,12 @@ def teardown(state: dict) -> None:
         if left:
             say(f"{len(left)} container(s) survived compose down; removing")
             run(["docker", "rm", "-f", *left], check=False)
-            networks = quiet(["docker", "network", "ls", "-q", "--filter",
-                              f"label=com.docker.compose.project={stack}"])
-            if networks.stdout.split():
-                run(["docker", "network", "rm", *networks.stdout.split()],
-                    check=False)
+        networks = labelled(["network", "ls", "-q"], stack)
+        if networks:
+            run(["docker", "network", "rm", *networks], check=False)
+        volumes = labelled(["volume", "ls", "-q"], stack)
+        if volumes:
+            run(["docker", "volume", "rm", "-f", *volumes], check=False)
         left = project_containers(stack)
         if left:
             raise Failure(f"{len(left)} container(s) of stack {stack} could "
@@ -1036,6 +1440,8 @@ def op_down() -> None:
 
 
 def main() -> None:
+    if os.environ.get("RUNNER_OS", "Linux") != "Linux":
+        raise Failure("qemu-tool-action needs a Linux runner")
     operation = inp("operation", "up")
     if operation not in OPERATIONS:
         raise Failure(f"operation must be one of {', '.join(OPERATIONS)}, "
@@ -1047,8 +1453,9 @@ def main() -> None:
     elif operation == "down":
         op_down()
     else:
-        base = base_dir()
-        {"up": op_up, "install": op_install, "command": op_command}[operation](base)
+        base = base_dir(operation)
+        {"up": op_up, "install": op_install,
+         "command": op_command}[operation](base)
 
 
 def post() -> None:
@@ -1057,19 +1464,33 @@ def post() -> None:
     if not path or not Path(path).is_file():
         return
     state = json.loads(Path(path).read_text())
+    if inp("teardown", "always") == "never":
+        say(f"teardown: never -- stack {state['stack_name']} is left up")
+        return
+    teardown(state)
+
+
+def entry(phase: str) -> int:
     try:
-        if inp("teardown", "always") == "never":
-            say(f"teardown: never -- stack {state['stack_name']} is left up")
-            return
-        teardown(state)
-    except Exception as exc:  # noqa: BLE001 - a post step must not mask the job
-        warn(f"teardown of stack {state.get('stack_name')}: {exc}")
+        post() if phase == "post" else main()
+        return 0
+    except Failure as failure:
+        if phase == "post":
+            warn(f"teardown: {failure}")
+            return 0
+        print(f"::error::{command_text(failure)}", flush=True)
+        return 1
+    except Exception as exc:  # noqa: BLE001 - say what it was, then the trace
+        print("::group::Traceback", flush=True)
+        traceback.print_exc(file=sys.stdout)
+        print("::endgroup::", flush=True)
+        text = command_text(f"qemu-tool-action: {type(exc).__name__}: {exc}")
+        if phase == "post":
+            print(f"::warning::{text}", flush=True)
+            return 0
+        print(f"::error::{text}", flush=True)
+        return 1
 
 
 if __name__ == "__main__":
-    phase = sys.argv[1] if len(sys.argv) > 1 else "main"
-    try:
-        post() if phase == "post" else main()
-    except Failure as failure:
-        print(f"::error::{failure}", flush=True)
-        sys.exit(1)
+    sys.exit(entry(sys.argv[1] if len(sys.argv) > 1 else "main"))

@@ -70,8 +70,9 @@ def inputs(**values):
 class Inventory(unittest.TestCase):
     def test_hosts_ports_and_addresses(self):
         shared, hosts = qta.parse_inventory(INVENTORY)
-        self.assertEqual(shared, {"ansible_host": "127.0.0.1",
-                                  "ansible_user": "ubuntu"})
+        self.assertEqual(shared, {
+            "ansible_host": "127.0.0.1", "ansible_user": "ubuntu",
+            "fleet_guest_rocjitsu_image": "docker.io/x/rocjitsu:20261112"})
         self.assertEqual([h["name"] for h in hosts],
                          ["rocm-golden-1", "rocm-golden-2"])
         self.assertEqual([h["ansible_port"] for h in hosts], ["2222", "2223"])
@@ -117,6 +118,13 @@ class Overlay(unittest.TestCase):
             "vm-count": "1", "vm-vcpus": "4", "vm-vmem": "6144",
             "vm-shm-size": "7168m", "vm-nvme": "2", "ernic-tap": "false"})
 
+    def test_a_size_in_fleet_lines_gets_its_shm_and_counts_as_sized(self):
+        with inputs(fleet="vm-vmem: 8192"):
+            elements = qta.overlay_elements()
+        self.assertEqual(elements["vm-shm-size"], "9216m")
+        self.assertTrue(qta.sized_by_caller(elements))
+        self.assertFalse(qta.sized_by_caller({"vm-count": "2"}))
+
     def test_fleet_lines_outrank_the_derived_shm(self):
         with inputs(vmem="4096", fleet="vm-shm-size: 8g"):
             self.assertEqual(qta.overlay_elements()["vm-shm-size"], "8g")
@@ -159,7 +167,8 @@ VMS = [{"name": f"g-{i}", "index": i, "ssh_host": "127.0.0.1",
         "ssh_port": 2221 + i, "username": "ubuntu",
         "ssh_key_file": "/k/id_rsa", "ssh_cmd": "",
         "rdma_ip": f"192.168.100.{10 + i}", "rdma_ips": [],
-        "rdma_device": "rocm-rdma-ernic0"} for i in (1, 2, 3)]
+        "rdma_device": "rocm-rdma-ernic0", "gpu": "loaded"}
+       for i in (1, 2, 3)]
 
 
 class Guests(unittest.TestCase):
@@ -170,6 +179,7 @@ class Guests(unittest.TestCase):
         self.assertEqual(names("first"), ["g-1"])
         self.assertEqual(names("last"), ["g-3"])
         self.assertEqual(names("3, g-1"), ["g-3", "g-1"])
+        self.assertEqual(names("1,"), ["g-1"])
         with self.assertRaises(qta.Failure):
             qta.select(VMS, "9")
 
@@ -227,6 +237,22 @@ class Plumbing(unittest.TestCase):
             qta.main()
         self.assertIn("operation: command", str(ctx.exception))
 
+    def test_what_the_marketplace_reads(self):
+        """The listing's name is its URL; the description is capped at 125."""
+        lines = (Path(qta.__file__).parent / "action.yml").read_text().splitlines()
+        self.assertEqual(lines[0], "name: qemu-tool")
+        start = lines.index("description: >-")
+        folded = []
+        for line in lines[start + 1:]:
+            if not line.startswith("  "):
+                break
+            folded.append(line.strip())
+        self.assertLessEqual(len(" ".join(folded)), 125)
+        branding = lines[lines.index("branding:") + 1:][:2]
+        self.assertEqual(sorted(b.split(":")[0].strip() for b in branding),
+                         ["color", "icon"])
+        self.assertIn("  using: node24", lines)
+
     def test_action_yml_and_code_agree_on_inputs(self):
         root = Path(qta.__file__).parent
         declared = set()
@@ -240,9 +266,235 @@ class Plumbing(unittest.TestCase):
                 declared.add(line.strip().rstrip(":"))
         import re
         source = (root / "qemu_tool_action.py").read_text()
-        used = set(re.findall(r'(?:inp|flag|lines_of)\(\s*"([a-z-]+)"', source))
-        used |= {"run", "vm-count"}  # read raw; read in a loop
+        used = set(re.findall(r'(?:inp|flag|lines_of|whole_number)\(\s*"([a-z-]+)"', source))
+        used |= {"run", "vm-count", "vcpus", "vmem"}  # read raw; in a loop
         self.assertEqual(declared, used)
+
+
+FAKE_SSH = """#!/usr/bin/env bash
+# Stands in for ssh: runs the remote command locally, in a directory that
+# plays the guest's home, chosen by the -p port.
+port=; while [ $# -gt 1 ]; do
+  case "$1" in -p) port=$2; shift 2;; -o|-i) shift 2;; *) shift;; esac
+done
+home="$QT_FAKE_GUESTS/$port"; mkdir -p "$home"; cd "$home"
+HOME="$home" exec bash -c "$1"
+"""
+
+
+class WithFakeGuests(unittest.TestCase):
+    """copy, run and fetch against a stub ssh, one directory per guest."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        (root / "bin").mkdir()
+        ssh = root / "bin" / "ssh"
+        ssh.write_text(FAKE_SSH)
+        ssh.chmod(0o755)
+        self.guests = root / "guests"
+        patch = mock.patch.dict(os.environ, {
+            "PATH": f"{root / 'bin'}{os.pathsep}{os.environ['PATH']}",
+            "QT_FAKE_GUESTS": str(self.guests)})
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.src = root / "src"
+        (self.src / "sub").mkdir(parents=True)
+        (self.src / "a.txt").write_text("alpha")
+        (self.src / "sub" / "b.txt").write_text("beta")
+        self.state = {"state_file": str(root / "action" / "ci" / "state.json"),
+                      "fetch_dir": str(root / "fetched")}
+        Path(self.state["state_file"]).parent.mkdir(parents=True)
+
+    def home(self, vm):
+        return self.guests / str(vm["ssh_port"])
+
+    def test_copy_lands_in_every_guest(self):
+        self.assertEqual(qta.copy_all(VMS, [f"{self.src}:~/proj"]), "~/proj")
+        for vm in VMS:
+            self.assertEqual((self.home(vm) / "proj/sub/b.txt").read_text(), "beta")
+
+    def test_run_sees_its_guest_and_starts_in_the_copy(self):
+        with inputs(copy=str(self.src), run_on="all"), mock.patch.dict(
+                os.environ, {"INPUT_RUN": 'cat a.txt > seen; echo "$QT_VM_INDEX" >> seen'}):
+            qta.in_guests(self.state, VMS)
+        for vm in VMS:
+            self.assertEqual((self.home(vm) / "workspace/seen").read_text(),
+                             f"alpha{vm['index']}\n")
+        # Remembered for a later exec step.
+        self.assertEqual(json.loads(Path(self.state["state_file"]).read_text())
+                         ["workdir"], "workspace")
+
+    def test_a_failure_on_one_guest_fails_the_step_and_names_it(self):
+        with mock.patch.dict(os.environ, {
+                "INPUT_RUN": '[ "$QT_VM_INDEX" != 2 ] || exit 3'}), \
+                self.assertRaises(qta.Failure) as ctx:
+            qta.in_guests(self.state, VMS)
+        self.assertIn("g-2", str(ctx.exception))
+        self.assertNotIn("g-1", str(ctx.exception))
+
+    def test_errexit_and_non_utf8_output(self):
+        with mock.patch.dict(os.environ, {
+                "INPUT_RUN": "printf '\\xff\\n'; false; touch reached"}), \
+                self.assertRaises(qta.Failure):
+            qta.in_guests(self.state, VMS)
+        self.assertFalse((self.home(VMS[0]) / "reached").exists())
+
+    def test_the_script_does_not_read_its_own_stdin(self):
+        with inputs(run_on="first"), mock.patch.dict(
+                os.environ, {"INPUT_RUN": "cat > /dev/null\ntouch after-cat"}):
+            qta.in_guests(self.state, VMS)
+        self.assertTrue((self.home(VMS[0]) / "after-cat").exists())
+
+    def test_fetch_runs_even_when_the_script_fails(self):
+        with inputs(fetch="out\nabsent"), mock.patch.dict(os.environ, {
+                "INPUT_RUN": "mkdir out; echo r > out/report; exit 1"}), \
+                self.assertRaises(qta.Failure):
+            qta.in_guests(self.state, VMS)
+        for vm in VMS:
+            got = Path(self.state["fetch_dir"]) / vm["name"] / "out" / "report"
+            self.assertEqual(got.read_text(), "r\n")
+
+
+class State(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+
+    def fleet(self, name):
+        state = {"state_file": str(qta.state_path(self.base, name)),
+                 "stack_name": name,
+                 "stack_dir": str(self.base / "stacks" / name)}
+        qta.write_state(state)
+        return state
+
+    def test_ambient_fleet_when_nothing_is_named(self):
+        ci = self.fleet("ci")
+        with mock.patch.dict(os.environ, {"QEMU_TOOL_ACTION_STATE": ci["state_file"]}, clear=True):
+            self.assertEqual(qta.load_state()["stack_name"], "ci")
+
+    def test_a_named_fleet_is_that_fleet_or_an_error(self):
+        self.fleet("a")
+        b = self.fleet("b")
+        env = {"QEMU_TOOL_ACTION_STATE": b["state_file"]}
+        with mock.patch.dict(os.environ, env, clear=True), inputs(stack_name="a"):
+            self.assertEqual(qta.load_state()["stack_name"], "a")
+        with mock.patch.dict(os.environ, env, clear=True), \
+                inputs(stack_dir=str(self.base / "stacks" / "a")):
+            self.assertEqual(qta.load_state()["stack_name"], "a")
+        with mock.patch.dict(os.environ, env, clear=True), \
+                inputs(stack_name="nope"), self.assertRaises(qta.Failure):
+            qta.load_state()
+
+    def test_no_fleet_at_all(self):
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                self.assertRaises(qta.Failure):
+            qta.load_state()
+
+    def test_in_network_manifest_uses_the_container_address(self):
+        stack = self.base / "stacks" / "ci"
+        stack.mkdir(parents=True)
+        (stack / "fleet-inventory.yml").write_text(INVENTORY)
+        with mock.patch.object(qta, "container_ip", return_value="172.30.3.1") as ip:
+            manifest = qta.build_manifest({
+                "stack_dir": str(stack), "key_dir": str(self.base),
+                "stack_name": "ci", "in_network": True})
+        ip.assert_any_call("ci-qemu-2-1")
+        self.assertEqual({(v["ssh_host"], v["ssh_port"]) for v in manifest},
+                         {("172.30.3.1", 2222)})
+
+
+class Install(unittest.TestCase):
+    def test_reuse_rules(self):
+        job = "7:1:build"
+        same = job + "\nqemu-tool>=2.1,<3"
+        other = job + "\nqemu-tool==2.1.0"
+        self.assertTrue(qta.reusable(same, same, asked=True))
+        # exec/down name no version: never reinstall under a running fleet.
+        self.assertTrue(qta.reusable(other, same, asked=False))
+        self.assertFalse(qta.reusable(other, same, asked=True))
+        self.assertFalse(qta.reusable("8:1:build\nx", "7:1:build\nx", asked=False))
+        # Outside a runner there is no job to belong to.
+        self.assertFalse(qta.reusable("::\nx", "::\nx", asked=False))
+
+
+class Reporting(unittest.TestCase):
+    def capture(self, phase, **patches):
+        import contextlib
+        import io
+        out = io.StringIO()
+        with contextlib.ExitStack() as stack:
+            for name, value in patches.items():
+                stack.enter_context(mock.patch.object(qta, name, value))
+            stack.enter_context(contextlib.redirect_stdout(out))
+            code = qta.entry(phase)
+        return code, out.getvalue()
+
+    def test_a_failure_is_one_error_line(self):
+        code, out = self.capture("main", main=mock.Mock(
+            side_effect=qta.Failure("two\nlines, 100%")))
+        self.assertEqual(code, 1)
+        self.assertIn("::error::two%0Alines, 100%25\n", out)
+
+    def test_an_unexpected_exception_is_an_error_with_its_trace(self):
+        code, out = self.capture("main", main=mock.Mock(side_effect=KeyError("k")))
+        self.assertEqual(code, 1)
+        self.assertIn("::error::qemu-tool-action: KeyError", out)
+        self.assertIn("Traceback", out)
+
+    def test_post_never_fails_the_job(self):
+        for boom in (qta.Failure("x"), RuntimeError("y")):
+            code, out = self.capture("post", post=mock.Mock(side_effect=boom))
+            self.assertEqual(code, 0)
+            self.assertIn("::warning::", out)
+            self.assertNotIn("::error::", out)
+
+    def test_teardown_goes_on_when_the_logs_cannot_be_collected(self):
+        calls = []
+        state = {"stack_name": "ci", "stack_dir": "/nonexistent",
+                 "logs_dir": "/nonexistent/logs"}
+        with mock.patch.object(qta, "project_containers",
+                               side_effect=[["c1"], ["c1"], []]), \
+                mock.patch.object(qta, "collect_logs", side_effect=OSError("disk")), \
+                mock.patch.object(qta, "labelled", return_value=[]), \
+                mock.patch.object(qta, "run", side_effect=lambda cmd, **k: calls.append(cmd)):
+            import contextlib
+            import io
+            with contextlib.redirect_stdout(io.StringIO()):
+                qta.teardown(state)
+        self.assertIn(["docker", "rm", "-f", "c1"], calls)
+
+    def test_inputs_are_refused_before_boot(self):
+        for bad in ({"wait_for": "soon"}, {"wait_timeout": "5m"},
+                    {"env": "no equals"}, {"copy": "/nonexistent/x"},
+                    {"wait_for": "none", "fetch": "out"}, {"fetch": ":out"}):
+            with mock.patch.dict(os.environ, {}, clear=True), inputs(**bad), \
+                    self.assertRaises(qta.Failure, msg=str(bad)):
+                qta.validate_guest_inputs()
+        with mock.patch.dict(os.environ, {}, clear=True), inputs(wait_for="RDMA"):
+            self.assertEqual(qta.validate_guest_inputs(), "rdma")
+
+    def test_mount_point_lookup(self):
+        info = ("22 1 0:20 / / rw - overlay overlay rw\n"
+                "30 22 8:1 /var/lib/qemu-tool /var/lib/qemu-tool rw - ext4 /dev/sda1 rw\n"
+                "31 22 8:1 /home/runner/work /__w rw - ext4 /dev/sda1 rw\n")
+        self.assertEqual(qta.mount_point(Path("/var/lib/qemu-tool/stacks"), info),
+                         "/var/lib/qemu-tool")
+        self.assertEqual(qta.mount_point(Path("/var/lib/qemu-tool"), info),
+                         "/var/lib/qemu-tool")
+        # A sibling that only shares a prefix is on the image's own disk.
+        self.assertEqual(qta.mount_point(Path("/var/lib/qemu-tool2"), info), "/")
+        self.assertEqual(qta.mount_point(Path("/opt/x"), info), "/")
+
+    def test_container_without_the_shared_mount(self):
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(qta, "in_container", return_value=True), \
+                mock.patch.object(qta, "_shared_with_host", return_value=False):
+            with self.assertRaises(qta.Failure) as ctx:
+                qta.base_dir("up")
+            self.assertIn("-v /var/lib/qemu-tool", str(ctx.exception))
 
 
 if __name__ == "__main__":

@@ -1,28 +1,115 @@
 name: qemu-tool-action - Release
 
+# Pushing vX.Y.Z creates the GitHub Release from CHANGELOG.md and moves the
+# floating vX and vX.Y tags. The Marketplace listing is NOT updated by this:
+# that takes a click in the release's edit page, see RELEASING.md.
+
 on:
   push:
     tags:
       - 'v*.*.*'
 
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
 
-  update-floating-tags:
-    name: Update floating tags
+  release:
+    name: GitHub Release and floating tags
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      TAG: ${{ github.ref_name }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4.3.1
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
-      - name: Move v1.x and v1 alias tags to this commit
+      # The trigger is a glob and also matches v2.0.0-rc1 and v2.0.0.1, which
+      # would otherwise move v2 onto a candidate or move v2.0.0 itself.
+      - name: Refuse a malformed tag
         run: |
-          TAG="${GITHUB_REF_NAME}"      # e.g. v1.2.3
-          MAJOR="${TAG%%.*}"            # v1
-          MINOR="${TAG%.*}"             # v1.2
-          echo "Releasing $TAG → aliases $MAJOR and $MINOR"
+          parts=$(scripts/release-tags.sh parse "$TAG") || {
+            echo "::error::$TAG is not vMAJOR.MINOR.PATCH. Nothing was released and no floating tag was moved."
+            exit 1
+          }
+          echo "$parts" >> "$GITHUB_ENV"
+
+      - name: Refuse a tag that is not on the default branch or a release branch
+        run: |
+          if git merge-base --is-ancestor "$GITHUB_SHA" "origin/$DEFAULT_BRANCH"; then
+            exit 0
+          fi
+          if git branch -r --contains "$GITHUB_SHA" | grep -qE '^\s*origin/release/'; then
+            exit 0
+          fi
+          echo "::error::$TAG ($GITHUB_SHA) is on neither $DEFAULT_BRANCH nor a release/* branch. Merge first, then tag."
+          exit 1
+
+      # The unit tests include what the Marketplace reads from action.yml:
+      # the listing's name, the 125-character description and the branding.
+      - name: Tests
+        run: |
+          python3 -m unittest discover -s tests
+          tests/smoke.sh
+          tests/test_release.sh
+
+      - name: The README's examples use this major version
+        run: |
+          if ! grep -q "qemu-tool-action@$MAJOR\b" README.md; then
+            echo "::error::README.md has no example using @$MAJOR"
+            exit 1
+          fi
+
+      - name: Release notes from CHANGELOG.md
+        run: |
+          scripts/release-tags.sh notes "$VERSION" CHANGELOG.md > "$RUNNER_TEMP/notes.md" || {
+            echo "::error::CHANGELOG.md has no '## [$VERSION]' section, or it is empty."
+            exit 1
+          }
+          cat "$RUNNER_TEMP/notes.md"
+
+      - name: Create the GitHub Release
+        run: |
+          latest=false
+          [ "$(git tag -l | scripts/release-tags.sh newest 'v')" = "$TAG" ] && latest=true
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md"
+          else
+            gh release create "$TAG" --verify-tag --title "$TAG" \
+              --notes-file "$RUNNER_TEMP/notes.md" --latest="$latest"
+          fi
+
+      # A floating tag only ever moves forward: v2 follows the newest v2.x.y
+      # and v2.0 the newest v2.0.y. A patch on an older line leaves the
+      # newer one alone.
+      - name: Move the floating tags
+        run: |
           git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -fa "$MAJOR" -m "Track $TAG"
-          git tag -fa "$MINOR" -m "Track $TAG"
-          git push origin "$MAJOR" "$MINOR" --force
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          for alias in "$MINOR" "$MAJOR"; do
+            if [ "$(git tag -l | scripts/release-tags.sh newest "$alias.")" = "$TAG" ]; then
+              git tag -fa "$alias" -m "Track $TAG" "${GITHUB_SHA}^{commit}"
+              git push --force origin "refs/tags/$alias"
+              echo "$alias -> $TAG" | tee -a "$GITHUB_STEP_SUMMARY"
+            else
+              echo "$alias left alone: $TAG is not the newest release it covers"
+            fi
+          done
+
+      - name: Say what is left to do by hand
+        run: |
+          {
+            echo "### One manual step left"
+            echo "The Marketplace listing shows the previous release until someone ticks the box:"
+            echo "https://github.com/${GITHUB_REPOSITORY}/releases/edit/${TAG}"
+            echo "-> 'Publish this Action to the GitHub Marketplace' -> Update release."
+            echo "See RELEASING.md."
+          } >> "$GITHUB_STEP_SUMMARY"
