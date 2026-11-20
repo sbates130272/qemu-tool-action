@@ -7,6 +7,61 @@ that follow the newest matching release.
 
 ## [Unreleased]
 
+### Added
+
+- `qemu-tool-ref`: install qemu-tool from a tag, a branch or a full commit
+  SHA of qemu-minimal instead of from PyPI, with `qemu-tool-repository` to
+  name a fork. Outputs `qemu-tool-sha` and `qemu-tool-checkout`.
+- `xml-overlay`: fleet XML files layered on a shipped flavor or on a fleet
+  of your own, so a change kept in a file no longer needs `extra-args`.
+- The fleet is read and rendered by qemu-tool before anything is pulled, so
+  an element the installed version does not know or a guest image on a
+  moving tag fails in the first minute, in qemu-tool's own words. A fleet
+  with no `<backing-ref>` is refused by the action.
+- `ssh-key-file` and `ssh-user`, for a guest image that was not published
+  with `qemu-tool publish-qcow`.
+- `nics` in each `vm-manifest` entry, and `QT_NIC_IPS` for the script.
+- `examples/fleet-minimal.xml` and `examples/overlay-one-guest.xml`, and a
+  "Which fleet" and "A fleet of your own" guide in the README.
+
+### Changed
+
+- The stack's own containers now run the runner's qemu-tool. They used to
+  install the latest release from PyPI at start, whatever the runner had,
+  so a pinned `qemu-tool-version` pinned only half of the stack.
+  `container-qemu-tool: pypi` restores that.
+- `size-from-host` defaults to `auto`: guests are sized from the runner
+  only when neither the inputs nor a fleet XML file of your own sets a
+  size. Sizes in an `xml` file used to be overridden unless it was set to
+  `false`; `size-from-host: true` still does that.
+- `qemu-tool-source` is installed from a copy and no longer editable, so
+  nothing is written into the checkout. It still overrides
+  `qemu-tool-version`; `qemu-tool-ref` cannot be combined with either.
+- The host is prepared before qemu-tool is installed (it was after), so
+  that `qemu-tool-ref` can use the git that step installs.
+- `flavor` takes any fleet the installed qemu-tool ships, and an unknown
+  one is refused with the names that version has.
+- `rdma_ip`, and `QT_RDMA_IP`, are the address of the NIC qemu-tool treats
+  as the guest's own, the one on the mesh, where a guest has several. It
+  was the first NIC listed.
+- `gpu-generation` defaults to the generation the fleet's
+  `<rocjitsu-config>` names.
+- `quick-start up` is run from the action's own directory. Relative paths
+  given to its file and directory flags in `extra-args` are still taken
+  against the workspace.
+- `fleet-xml` always lists the fleet's file first; it was empty for a
+  shipped flavor used unchanged.
+
+### Fixed
+
+- `wait-for: rdma` on a guest image without rdma-core says so instead of
+  suggesting more vCPUs.
+- A guest whose image has no `amdgpu-probe` is reported as such in the GPU
+  step.
+- The `args` example in `action.yml` used `gen-compose --check` without
+  `--output-dir`, which compares a fleet of your own against a shipped
+  stack.
+
 ## [2.0.0] - 2026-11-19
 
 A rebuild around [`qemu-tool`](https://github.com/sbates130272/qemu-minimal)

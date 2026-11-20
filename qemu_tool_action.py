@@ -28,6 +28,7 @@ import traceback
 import urllib.request
 import uuid
 from pathlib import Path
+from xml.etree import ElementTree
 from xml.sax.saxutils import escape
 
 OPERATIONS = ("up", "install", "exec", "command", "down")
@@ -35,6 +36,9 @@ NS_FLEET = "http://qemu-tool/fleet/1.0"
 DEFAULT_BASE = Path("/var/lib/qemu-tool")
 MIN_ORAS = (1, 3, 4)
 STACK_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+# Under <work-dir>/action each stack has a directory of its own, by name.
+# What the action keeps for itself there has names no stack can have.
+ACTION_OWN = Path("action") / ".tool"
 # Keepalives are explicit so a wedged guest is dropped after three minutes
 # on any OpenSSH, not only on Debian's, which turns them on under BatchMode.
 SSH_OPTS = [
@@ -270,20 +274,85 @@ def base_dir(operation: str) -> Path:
 
 # ── Installing qemu-tool and what it needs ───────────────────────────────────
 
-def requirement() -> list[str]:
+def clean_copy(source: Path, target: Path) -> None:
+    """Copy a source tree without what a build or a checkout leaves in it."""
+    shutil.rmtree(target, ignore_errors=True)
+    shutil.copytree(source, target, ignore=shutil.ignore_patterns(
+        "build", "*.egg-info", "__pycache__", "*.pyc", ".git"))
+
+
+def repository_url(name: str) -> str:
+    if "://" in name or name.startswith("git@"):
+        return name
+    return f"https://github.com/{name}.git"
+
+
+def fetch_ref(base: Path, ref: str) -> tuple[Path, str]:
+    """A shallow checkout of qemu-minimal at a tag, a branch or a commit."""
+    url = repository_url(inp("qemu-tool-repository",
+                             "sbates130272/qemu-minimal"))
+    if shutil.which("git") is None:
+        raise Failure("qemu-tool-ref needs git on PATH")
+    clone = base / ACTION_OWN / "qemu-minimal"
+    shutil.rmtree(clone, ignore_errors=True)
+    run(["git", "init", "-q", clone])
+    if run(["git", "-C", clone, "fetch", "-q", "--depth", "1", url, ref],
+           check=False).returncode != 0:
+        raise Failure(f"cannot fetch {ref!r} from {url}. qemu-tool-ref takes "
+                      "a tag, a branch or a full commit SHA.")
+    run(["git", "-C", clone, "checkout", "-q", "--detach", "FETCH_HEAD"])
+    sha = quiet(["git", "-C", clone, "rev-parse", "HEAD"]).stdout.strip()
+    if not (clone / "qemu" / "pyproject.toml").is_file():
+        raise Failure(f"{url} at {ref} has no qemu/pyproject.toml; it is not "
+                      "a qemu-minimal tree")
+    return clone, sha
+
+
+def check_install_inputs() -> None:
+    """qemu-tool-ref excludes the other two ways of saying which qemu-tool."""
+    others = [name for name in ("qemu-tool-version", "qemu-tool-source")
+              if inp(name)]
+    if inp("qemu-tool-ref") and others:
+        raise Failure(f"qemu-tool-ref and {' and '.join(others)} each say "
+                      "which qemu-tool to install; give one")
+
+
+def install_source(base: Path) -> dict:
+    """What to install, from the three inputs that can say."""
+    check_install_inputs()
+    version = inp("qemu-tool-version")
     source = inp("qemu-tool-source")
+    ref = inp("qemu-tool-ref")
+    if source and version:
+        # What 2.0.0 documented, kept: a source directory outranks a version.
+        warn("qemu-tool-source overrides qemu-tool-version; give one of them")
+    staged = base / ACTION_OWN / "src"
+    if ref:
+        clone, sha = fetch_ref(base, ref)
+        # Installed from a copy, so the checkout stays as fetched.
+        clean_copy(clone / "qemu", staged)
+        return {"kind": "ref", "spec": [str(staged)], "sha": sha,
+                "checkout": str(clone), "label": f"ref {sha}"}
     if source:
         path = Path(source).expanduser().resolve()
         if not (path / "pyproject.toml").is_file():
             raise Failure(f"qemu-tool-source {path} has no pyproject.toml; "
                           "pass the qemu/ directory of a qemu-minimal checkout")
-        return ["-e", str(path)]
-    version = inp("qemu-tool-version", ">=2.1,<3")
+        # Not editable, and from a copy: nothing is written into the
+        # caller's checkout, and the install does not change under a fleet
+        # when the checkout does.
+        clean_copy(path, staged)
+        return {"kind": "source", "spec": [str(staged)], "sha": "",
+                "checkout": "", "label": f"source {path}"}
+    version = version or ">=2.1,<3"
     if version == "latest":
-        return ["qemu-tool"]
-    if version[0].isdigit():
-        return [f"qemu-tool=={version}"]
-    return [f"qemu-tool{version}"]
+        spec = "qemu-tool"
+    elif version[0].isdigit():
+        spec = f"qemu-tool=={version}"
+    else:
+        spec = f"qemu-tool{version}"
+    return {"kind": "pypi", "spec": [spec], "sha": "", "checkout": "",
+            "label": f"pypi {spec}"}
 
 
 def tool_python(tool: str) -> str:
@@ -299,21 +368,25 @@ def tool_python(tool: str) -> str:
     return sys.executable
 
 
-def reusable(marker_text: str, stamp: str, asked: bool) -> bool:
+def job_stamp() -> str:
+    return ":".join(os.environ.get(key, "") for key in
+                    ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_JOB"))
+
+
+def reusable(recorded: dict, job: str, asked: bool, label: str) -> bool:
     """May this step use the install an earlier step of the job made?
 
-    Yes when it is the same job and the step either named no version of its
-    own or named the one already there. A step that only runs `exec` or
-    `down` must not reinstall under a running fleet.
+    Yes when it is the same job and the step either named no qemu-tool of
+    its own or named the one already there. A later step must not reinstall
+    under a running fleet for want of saying which version it meant.
     """
-    if not stamp.split("\n")[0].strip(":"):
+    if not job.strip(":") or recorded.get("job") != job:
         return False
-    if marker_text.split("\n")[0] != stamp.split("\n")[0]:
-        return False
-    return not asked or marker_text == stamp
+    return not asked or recorded.get("label") == label
 
 
 def install_qemu_tool(base: Path) -> dict[str, str]:
+    source = {"kind": "preinstalled", "sha": "", "checkout": ""}
     if not flag("install", True):
         tool = shutil.which("qemu-tool")
         if tool is None:
@@ -322,31 +395,40 @@ def install_qemu_tool(base: Path) -> dict[str, str]:
         if sys.version_info < (3, 10):
             raise Failure("qemu-tool needs Python 3.10 or newer; this runner's "
                           f"python3 is {platform.python_version()}")
-        spec = requirement()
-        asked = bool(inp("qemu-tool-version") or inp("qemu-tool-source"))
-        venv = base / "action" / "venv"
-        job = ":".join(os.environ.get(key, "") for key in
-                       ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_JOB"))
-        stamp = job + "\n" + " ".join(spec)
-        marker = venv / ".qemu-tool-action"
-        entry = venv / "bin" / "qemu-tool"
-        have = marker.read_text() if marker.is_file() else ""
-        if have and entry.is_file() and reusable(have, stamp, asked):
+        asked = bool(inp("qemu-tool-version") or inp("qemu-tool-source")
+                     or inp("qemu-tool-ref"))
+        venv = base / ACTION_OWN / "venv"
+        job = job_stamp()
+        marker = venv / "qemu-tool-action.json"
+        entry: Path | None = venv / "bin" / "qemu-tool"
+        try:
+            recorded = json.loads(marker.read_text())
+        except (OSError, ValueError):
+            recorded = {}
+        if (recorded and entry.is_file() and not asked
+                and reusable(recorded, job, False, "")):
             say("reusing the install an earlier step of this job made")
-        elif quiet([sys.executable, "-m", "venv", "--clear",
-                    venv]).returncode == 0:
-            if have.split("\n")[0] == job and job.strip(":"):
-                warn("this step asks for a different qemu-tool than the one "
-                     "an earlier step of this job installed; reinstalling")
-            run([venv / "bin" / "python", "-m", "pip", "install", "-q",
-                 "--disable-pip-version-check", *spec])
-            marker.write_text(stamp)
+            source = recorded
         else:
-            entry = None
+            source = install_source(base)
+            if recorded and entry.is_file() and reusable(
+                    recorded, job, True, source["label"]):
+                say("reusing the install an earlier step of this job made")
+            elif quiet([sys.executable, "-m", "venv", "--clear",
+                        venv]).returncode == 0:
+                if recorded.get("job") == job and job.strip(":"):
+                    warn("this step asks for a different qemu-tool than the "
+                         "one an earlier step of this job installed; "
+                         "reinstalling")
+                run([venv / "bin" / "python", "-m", "pip", "install", "-q",
+                     "--disable-pip-version-check", *source["spec"]])
+                marker.write_text(json.dumps(dict(source, job=job)))
+            else:
+                entry = None
         if entry is not None:
             # Only the entry point goes on PATH. The venv's own bin holds a
             # python3 and a pip that must not shadow the runner's.
-            bin_dir = base / "action" / "bin"
+            bin_dir = base / ACTION_OWN / "bin"
             bin_dir.mkdir(parents=True, exist_ok=True)
             link = bin_dir / "qemu-tool"
             if link.is_symlink() or link.exists():
@@ -357,10 +439,10 @@ def install_qemu_tool(base: Path) -> dict[str, str]:
             # lands ahead of an image's own copy once its bin is on PATH.
             say("python3 -m venv is unavailable; installing with pip --user")
             pip = [sys.executable, "-m", "pip", "install", "-q", "--user"]
-            if run(pip + ["--break-system-packages", *spec],
+            if run(pip + ["--break-system-packages", *source["spec"]],
                    check=False).returncode != 0:
                 # pip before 23.0.1 does not know the flag, and needs none.
-                run(pip + spec)
+                run(pip + source["spec"])
             bin_dir = Path.home() / ".local" / "bin"
         add_path(bin_dir)
         tool = str(bin_dir / "qemu-tool")
@@ -368,14 +450,103 @@ def install_qemu_tool(base: Path) -> dict[str, str]:
             raise Failure(f"the install left no {tool}")
     version = quiet([tool, "--version"]).stdout.strip().split()[-1:]
     version_text = version[0] if version else "unknown"
-    say(f"qemu-tool {version_text} at {tool}")
+    where = f" ({source['kind']} {source['sha'][:12]})" if source["sha"] else ""
+    say(f"qemu-tool {version_text}{where} at {tool}")
     if version_text[0].isdigit() and int(version_text.split(".")[0]) < 2:
         raise Failure(f"qemu-tool {version_text} is a 1.x release; this "
                       "version of the action drives 2.x. Use "
                       "sbates130272/qemu-tool-action@v1 for 1.x.")
     set_output("qemu-tool-version", version_text)
     set_output("qemu-tool-path", tool)
-    return {"tool": tool, "python": tool_python(tool), "version": version_text}
+    set_output("qemu-tool-sha", source["sha"])
+    set_output("qemu-tool-checkout", source["checkout"])
+    return {"tool": tool, "python": tool_python(tool), "version": version_text,
+            "sha": source["sha"]}
+
+
+# What the stack's own containers run. Every qemu container starts by
+# installing qemu-tool: from a source tree at /qemu-tool-src/qemu when the
+# stack directory, which quick-start mounts there, holds one, else the
+# latest release from PyPI, whatever the runner has. A compose file rendered
+# by one version and executed by another is how a fleet breaks on the day a
+# release changes run-vm's command line, so the runner's own installed
+# package is put there, as a tree the container's install accepts.
+
+_PACKAGE_INFO = """import json
+from importlib import metadata
+from pathlib import Path
+import qemu_tool
+dist = metadata.distribution("qemu-tool")
+print(json.dumps({
+    "package": str(Path(qemu_tool.__file__).resolve().parent),
+    "version": dist.version,
+    "requires": [r for r in (dist.requires or []) if "extra ==" not in r],
+}))
+"""
+
+_PYPROJECT = """[build-system]
+requires = ["setuptools>=70"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qemu-tool"
+version = "{version}"
+requires-python = ">=3.10"
+dependencies = {requires}
+
+[project.scripts]
+qemu-tool = "qemu_tool.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["qemu_tool*"]
+"""
+
+
+def checkout_above(*starts: Path) -> Path | None:
+    """The qemu-minimal checkout quick-start would find from these places.
+
+    Its own test, on its own two starting points: the installed module and
+    the working directory. Finding one, it copies that tree's qemu/ into the
+    stack directory for the containers, over anything already there.
+    """
+    for start in starts:
+        start = Path(start).resolve()
+        for candidate in (start, *start.parents):
+            if ((candidate / "ansible" / "playbooks" / "vm-quickstart.yml")
+                    .is_file() and (candidate / "qemu" / "pyproject.toml")
+                    .is_file()):
+                return candidate
+    return None
+
+
+def container_source(python: str, stack_dir: Path) -> tuple[str, Path]:
+    """Put the runner's qemu-tool where the stack's containers install from.
+
+    Returns the version placed and the directory of the installed package.
+    """
+    found = quiet([python, "-c", _PACKAGE_INFO])
+    if found.returncode != 0:
+        raise Failure("cannot locate the installed qemu_tool package: "
+                      f"{found.stderr.strip()[-300:]}")
+    info = json.loads(found.stdout)
+    package = Path(info["package"])
+    target = stack_dir / "qemu"
+    stack_dir.mkdir(parents=True, exist_ok=True)
+    if ((package.parent / "pyproject.toml").is_file()
+            and not (package / "share").is_dir()):
+        # An editable install of a checkout: its qemu/ directory is the tree.
+        clean_copy(package.parent, target)
+    else:
+        # An installed package: its directory is all the containers need.
+        # A wheel carries the fleets and stacks inside it; a .deb keeps
+        # them under /usr/share, and run-vm and ernic-stats, which are what
+        # the containers run, read neither.
+        shutil.rmtree(target, ignore_errors=True)
+        target.mkdir()
+        clean_copy(package, target / "qemu_tool")
+        (target / "pyproject.toml").write_text(_PYPROJECT.format(
+            version=info["version"], requires=json.dumps(info["requires"])))
+    return info["version"], package
 
 
 def setup_kvm() -> None:
@@ -444,7 +615,7 @@ def setup_oras(base: Path) -> None:
                    if line.strip().endswith(name)), None)
     if wanted != hashlib.sha256(archive).hexdigest():
         raise Failure(f"{name} does not match its published sha256")
-    bin_dir = base / "action" / "bin"
+    bin_dir = base / ACTION_OWN / "bin"
     bin_dir.mkdir(parents=True, exist_ok=True)
     packed = bin_dir / name
     packed.write_bytes(archive)
@@ -484,6 +655,7 @@ def setup_host(base: Path) -> None:
 # ── Fleet settings ───────────────────────────────────────────────────────────
 
 _ELEMENT = re.compile(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*$")
+_SIZES = ("vm-vcpus", "vm-vmem")
 
 
 def overlay_elements() -> dict[str, str]:
@@ -501,7 +673,9 @@ def overlay_elements() -> dict[str, str]:
         match = re.match(r"^([^:=\s]+)\s*[:=]\s*(.*)$", line)
         if not match or not _ELEMENT.match(match.group(1)):
             raise Failure(f"fleet: cannot read {line!r}; write one "
-                          "`element: value` per line, e.g. `vm-nvme: 2`")
+                          "`element: value` per line, e.g. `vm-nvme: 2`. "
+                          "Anything with structure, such as a <devices> "
+                          "block, goes in a file named by xml or xml-overlay.")
         elements[match.group(1)] = match.group(2).strip()
     if elements.get("vm-vmem", "").isdigit() and "vm-shm-size" not in elements:
         # Guest RAM is a shared memfd and must fit the container's shm.
@@ -510,7 +684,19 @@ def overlay_elements() -> dict[str, str]:
 
 
 def sized_by_caller(elements: dict[str, str]) -> bool:
-    return bool({"vm-vcpus", "vm-vmem"} & set(elements))
+    return bool(set(_SIZES) & set(elements))
+
+
+def files_set_sizes(files: list[str]) -> bool:
+    """Does a fleet XML file of the caller's own size the guests?"""
+    for name in files:
+        try:
+            root = ElementTree.parse(name).getroot()
+        except (OSError, ElementTree.ParseError):
+            continue  # qemu-tool reports an unreadable file better
+        if any(child.tag.rsplit("}", 1)[-1] in _SIZES for child in root):
+            return True
+    return False
 
 
 def render_overlay(elements: dict[str, str]) -> str:
@@ -521,39 +707,144 @@ def render_overlay(elements: dict[str, str]) -> str:
             f'<fleet xmlns="{NS_FLEET}">\n{body}</fleet>\n')
 
 
+_FLAVORS = """import json
+from qemu_tool.quick_start import VARIANTS
+from qemu_tool.resources import STACKS, shipped_path
+print(json.dumps({name: str(shipped_path("stacks", STACKS, spec[0]))
+                  for name, spec in VARIANTS.items()}))
+"""
+
+
+def shipped_fleets(python: str) -> dict[str, str]:
+    """Every flavor the installed qemu-tool ships, and its fleet XML."""
+    found = quiet([python, "-c", _FLAVORS])
+    if found.returncode != 0:
+        raise Failure("cannot list the fleets this qemu-tool ships: "
+                      f"{found.stderr.strip()[-300:]}")
+    return json.loads(found.stdout)
+
+
 def packaged_fleet(python: str, flavor: str) -> Path:
-    code = ("import sys\n"
-            "from qemu_tool.quick_start import VARIANTS\n"
-            "from qemu_tool.resources import STACKS, shipped_path\n"
-            "print(shipped_path('stacks', STACKS, VARIANTS[sys.argv[1]][0]))\n")
-    found = quiet([python, "-c", code, flavor])
-    path = Path(found.stdout.strip() or "/nonexistent")
-    if found.returncode != 0 or not path.is_file():
-        raise Failure(f"cannot find the fleet XML of flavor {flavor!r} in "
-                      f"this qemu-tool install: {found.stderr.strip()[-300:]}")
+    fleets = shipped_fleets(python)
+    if flavor not in fleets:
+        raise Failure(f"this qemu-tool ships no flavor {flavor!r}; it has "
+                      f"{', '.join(sorted(fleets))}. A newer flavor needs a "
+                      "newer qemu-tool (qemu-tool-version or qemu-tool-ref).")
+    path = Path(fleets[flavor])
+    if not path.is_file():
+        raise Failure(f"the fleet XML of flavor {flavor!r} is missing from "
+                      f"this qemu-tool install ({path})")
     return path
 
 
-def fleet_layers(python: str, flavor: str, action_dir: Path,
-                 elements: dict[str, str]) -> list[str]:
-    layers = []
-    for entry in lines_of("xml"):
+def existing(name: str) -> list[str]:
+    files = []
+    for entry in lines_of(name):
         path = Path(entry).expanduser().resolve()
         if not path.is_file():
-            raise Failure(f"xml: {path} does not exist")
-        layers.append(str(path))
-    if not elements:
-        return layers
-    if not layers:
-        # quick-start replaces the flavor's file with any --xml it is given,
-        # so an overlay alone would be a fleet with nothing under it.
-        layers.append(str(packaged_fleet(python, flavor)))
-    overlay = action_dir / "overlay.xml"
-    overlay.write_text(render_overlay(elements))
-    say(f"wrote {overlay}:")
-    say(overlay.read_text())
-    layers.append(str(overlay))
-    return layers
+            raise Failure(f"{name}: {path} does not exist")
+        files.append(str(path))
+    return files
+
+
+def fleet_layers(python: str, flavor: str, action_dir: Path,
+                 elements: dict[str, str]) -> tuple[list[str], list[str]]:
+    """The fleet XML layers, lowest first, and which are the caller's own.
+
+    A fleet of the caller's (xml) or the flavor's shipped file; then the
+    caller's overlays (xml-overlay); then what the other inputs ask for.
+    """
+    own = existing("xml")
+    overlays = existing("xml-overlay")
+    if own and flavor != "default":
+        warn(f"flavor {flavor!r} is not used: xml names the fleet")
+    layers = own or [str(packaged_fleet(python, flavor))]
+    layers += overlays
+    if elements:
+        overlay = action_dir / "overlay.xml"
+        overlay.write_text(render_overlay(elements))
+        say(f"wrote {overlay}:")
+        say(overlay.read_text())
+        layers.append(str(overlay))
+    return layers, own + overlays
+
+
+_FLEET_INFO = """import json, sys
+from pathlib import Path
+from qemu_tool.fleet_xml import FleetXml
+cfg = FleetXml.parse_layers([Path(p) for p in sys.argv[1:]])
+print(json.dumps({key: getattr(cfg, key, None) for key in
+                  ("backing_ref", "count", "name_prefix", "rocjitsu_config")}))
+"""
+
+
+def check_fleet(tool: dict, layers: list[str]) -> dict:
+    """Have qemu-tool read and render the fleet before anything is pulled.
+
+    Its own refusals -- an element this version does not know, a guest image
+    on a tag that moves, a guest with no NIC -- then arrive in the first
+    minute and in its own words, not after a 2 GB download.
+    """
+    parsed = quiet([tool["python"], "-c", _FLEET_INFO, *layers])
+    if parsed.returncode != 0:
+        raise Failure(f"qemu-tool {tool['version']} cannot read this fleet:\n"
+                      f"{(parsed.stderr or parsed.stdout).strip()[-1500:]}")
+    command = [tool["tool"], "gen-compose", "--dry-run"]
+    for layer in layers:
+        command += ["--xml", layer]
+    rendered = quiet(command)
+    if rendered.returncode != 0:
+        raise Failure(f"qemu-tool {tool['version']} cannot render this "
+                      f"fleet:\n{rendered.stderr.strip()[-1500:]}")
+    # A dry run that succeeds writes the files to stdout and nothing but
+    # its warnings to stderr, and a warning runs to several lines.
+    if rendered.stderr.strip():
+        say(rendered.stderr.rstrip())
+    try:
+        return json.loads(parsed.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return {}
+
+
+def seed_key(state: dict, fleet: dict) -> None:
+    """Use the caller's key and login in place of the image's published ones.
+
+    quick-start fetches a guest's keypair from a referrer published beside
+    its image, and skips that when the key directory already holds a key
+    recorded against the same image. Writing that record is how an image
+    that was not made by `qemu-tool publish-qcow` gets in.
+    """
+    key_file = inp("ssh-key-file")
+    user = inp("ssh-user")
+    if not key_file:
+        if user:
+            raise Failure("ssh-user needs ssh-key-file, the private key the "
+                          "guest image accepts")
+        return
+    source = Path(key_file).expanduser().resolve()
+    if not source.is_file():
+        raise Failure(f"ssh-key-file {source} does not exist")
+    key_dir = Path(state["key_dir"])
+    key_dir.mkdir(parents=True, exist_ok=True)
+    key = key_dir / "id_rsa"
+    shutil.copyfile(source, key)
+    key.chmod(0o600)
+    checked = quiet(["ssh-keygen", "-y", "-P", "", "-f", key])
+    if checked.returncode not in (0, 127):  # 127: no ssh-keygen to ask
+        raise Failure(f"ssh-key-file {source} is not a private key this "
+                      "action can use; it has to be a private key with no "
+                      f"passphrase, not a .pub: {checked.stderr.strip()[-300:]}")
+    (key_dir / "image-ref").write_text((fleet.get("backing_ref") or "") + "\n")
+    info = key_dir / "vm-info.json"
+    if user:
+        info.write_text(json.dumps({"username": user}) + "\n")
+    else:
+        info.unlink(missing_ok=True)
+    # quick-start republishes the key under the images directory for
+    # `qemu-tool ssh`, and keeps a copy it finds there already.
+    for stale in ("quickstart_id_rsa", "quickstart_id_rsa.pub"):
+        (Path(state["images_dir"]) / "keys" / stale).unlink(missing_ok=True)
+    say(f"guest login: {user or 'the fleet XML account'} with {source}")
 
 
 # ── The guests ───────────────────────────────────────────────────────────────
@@ -586,11 +877,16 @@ def parse_inventory(text: str) -> tuple[dict[str, str], list[dict]]:
                 shared[key] = value
             continue
         if indent == hosts_indent + 2:
-            current = {"name": key, "nic_ips": []}
+            current = {"name": key, "nics": [], "nic_ips": []}
             hosts.append(current)
         elif current is not None:
-            if key == "ip" and value:
-                current["nic_ips"].append(value)
+            if stripped.startswith("- "):
+                current["nics"].append({})
+            if indent >= hosts_indent + 6 and current["nics"]:
+                # An entry of the guest's NIC list: index, mac, ip.
+                current["nics"][-1][key] = value
+                if key == "ip" and value:
+                    current["nic_ips"].append(value)
             elif value:
                 current.setdefault(key, value)
     return shared, hosts
@@ -640,8 +936,13 @@ def build_manifest(state: dict) -> list[dict]:
             address = host.get("ansible_host") or shared.get(
                 "ansible_host", "127.0.0.1")
             port = int(host.get("ansible_port", 2222))
-        ips = host["nic_ips"] or ([host["fleet_guest_ip"]]
-                                  if host.get("fleet_guest_ip") else [])
+        # fleet_guest_ip is the NIC qemu-tool treats as the guest's own:
+        # the first on the mesh, which is the one that reaches other guests.
+        own = host.get("fleet_guest_ip")
+        nics = host["nics"] or ([{"index": "1", "ip": own, "mac":
+                                  host.get("fleet_guest_ernic_mac", "")}]
+                                if own else [])
+        ips = [nic["ip"] for nic in nics if nic.get("ip")]
         manifest.append({
             "name": host["name"],
             "index": index,
@@ -650,8 +951,9 @@ def build_manifest(state: dict) -> list[dict]:
             "username": username,
             "ssh_key_file": str(key),
             "ssh_cmd": f"ssh -i {key} -p {port} {username}@{address}",
-            "rdma_ip": ips[0] if ips else None,
+            "rdma_ip": own or (ips[0] if ips else None),
             "rdma_ips": ips,
+            "nics": nics,
             "rdma_device": None,
             "gpu": None,
         })
@@ -694,6 +996,7 @@ def wait_for_ssh(state: dict, manifest: list[dict], deadline: float) -> None:
 
 
 _RDMA_PROBE = r"""
+command -v ibv_devinfo >/dev/null 2>&1 || { echo NOTOOL; exit 0; }
 dev=$(ibv_devinfo -l 2>/dev/null | sed -n '2p' | tr -d ' \t\r')
 [ -n "$dev" ] || { sudo -n modprobe ionic_rdma 2>/dev/null; exit 1; }
 ibv_devinfo -d "$dev" 2>/dev/null | grep -q PORT_ACTIVE || exit 1
@@ -706,6 +1009,11 @@ def wait_for_rdma(manifest: list[dict], deadline: float) -> None:
     for vm in manifest:
         while True:
             probe = bounded(ssh_base(vm) + ["bash -s"], 90, input=_RDMA_PROBE)
+            if probe.returncode == 0 and "NOTOOL" in probe.stdout:
+                raise Failure(f"{vm['name']}: the guest image has no "
+                              "ibv_devinfo. wait-for: rdma needs rdma-core "
+                              "in the guest; use wait-for: ssh for an image "
+                              "without it.")
             if probe.returncode == 0 and "DEV=" in probe.stdout:
                 found = dict(line.split("=", 1) for line
                              in probe.stdout.splitlines() if "=" in line)
@@ -722,8 +1030,9 @@ def wait_for_rdma(manifest: list[dict], deadline: float) -> None:
                     "uname -r; lsmod | grep -E '^ionic'; "
                     "lspci -nn | grep -i 1dd8; ibv_devinfo; nproc"])
                 raise Failure(f"{vm['name']} has no RDMA device with an "
-                              "active port. ionic_rdma needs at least 4 "
-                              "vCPUs in the guest.")
+                              "active port. The emulated NIC's driver "
+                              "(ionic_rdma) needs at least 4 vCPUs in the "
+                              "guest, and a guest image that carries it.")
             time.sleep(5)
 
 
@@ -826,6 +1135,20 @@ def bring_up_gpu(vm: dict, firmware: Path, fwset: str) -> None:
         raise Failure(f"{vm['name']}: amdgpu did not bind the emulated GPU")
 
 
+def gpu_generation(state: dict) -> str:
+    """The generation to make firmware for: the input, else the fleet's.
+
+    A fleet names its GPU by rocjitsu's config file, e.g.
+    gfx1250_mi455x.json; the generation is what precedes the underscore.
+    """
+    asked = inp("gpu-generation")
+    if asked:
+        return asked
+    config = (state.get("fleet") or {}).get("rocjitsu_config") or ""
+    stem = Path(config).name.split("_")[0]
+    return stem if re.match(r"^gfx[0-9]+$", stem) else "gfx1250"
+
+
 def setup_gpus(state: dict, manifest: list[dict]) -> None:
     """Make each guest's emulated GPU usable, where it has one."""
     pending = []
@@ -837,6 +1160,9 @@ def setup_gpus(state: dict, manifest: list[dict]) -> None:
             raise Failure(f"{vm['name']}: amdgpu is loaded with parameters "
                           "other than the emulation's; only a reboot of the "
                           "guest clears that")
+        elif vm["gpu"] == "unknown":
+            say(f"  {vm['name']}: no amdgpu-probe in this guest image, so "
+                "its GPU is left as booted (gpu: false says so on purpose)")
         else:
             say(f"  {vm['name']}: GPU {vm['gpu']}, nothing to do")
     if not pending:
@@ -852,8 +1178,7 @@ def setup_gpus(state: dict, manifest: list[dict]) -> None:
     for fwset in sorted(set(sets.values())):
         tars[fwset] = (Path(state["state_file"]).parent
                        / f"gpu-firmware-{fwset}.tar")
-        generate_firmware(image, inp("gpu-generation", "gfx1250"), fwset,
-                          tars[fwset])
+        generate_firmware(image, gpu_generation(state), fwset, tars[fwset])
     with concurrent.futures.ThreadPoolExecutor(len(pending)) as pool:
         jobs = [(vm, pool.submit(bring_up_gpu, vm, tars[sets[vm["name"]]],
                                  sets[vm["name"]])) for vm in pending]
@@ -1037,6 +1362,7 @@ def guest_env(vm: dict, manifest: list[dict]) -> dict[str, str]:
         "QT_VM_NAMES": " ".join(peer["name"] for peer in manifest),
         "QT_RDMA_IP": vm["rdma_ip"] or "",
         "QT_RDMA_DEVICE": vm["rdma_device"] or "",
+        "QT_NIC_IPS": " ".join(vm.get("rdma_ips") or []),
         "QT_RDMA_IPS": " ".join(peer["rdma_ip"] or "" for peer in manifest),
         "QT_PEER_RDMA_IPS": " ".join(peer["rdma_ip"] or "" for peer in manifest
                                      if peer is not vm),
@@ -1205,12 +1531,40 @@ def summarise(state: dict, manifest: list[dict], seconds: float) -> None:
 # ── Operations ───────────────────────────────────────────────────────────────
 
 def op_install(base: Path) -> dict[str, str]:
-    with group("Install qemu-tool"):
-        tool = install_qemu_tool(base)
+    if flag("install", True):
+        check_install_inputs()
+    # The host first: fetching qemu-tool-ref needs the git this may install.
     if flag("setup-host", True):
         with group("Prepare the host"):
             setup_host(base)
-    return tool
+    with group("Install qemu-tool"):
+        return install_qemu_tool(base)
+
+
+# The flags of `quick-start up` that name a file or a directory.
+_PATH_FLAGS = ("--xml", "--report-dir", "--repo-root", "--stack-dir",
+               "--key-dir", "--images")
+
+
+def absolute_paths(arguments: list[str], against: Path) -> list[str]:
+    """extra-args, with relative paths made absolute against the workspace.
+
+    quick-start is run from the action's own directory, and resolves a path
+    against where it runs; the caller wrote theirs against the workspace.
+    """
+    out: list[str] = []
+    expect_path = False
+    for word in arguments:
+        flag_name, eq, value = word.partition("=")
+        if expect_path:
+            out.append(str((against / word).resolve()))
+            expect_path = False
+        elif eq and flag_name in _PATH_FLAGS:
+            out.append(f"{flag_name}={(against / value).resolve()}")
+        else:
+            out.append(word)
+            expect_path = word in _PATH_FLAGS
+    return out
 
 
 def op_up(base: Path) -> None:
@@ -1226,8 +1580,11 @@ def op_up(base: Path) -> None:
                       "letters, digits, - and _ (it is the compose project "
                       "name)")
     elements = overlay_elements()
-    host_sizing = flag("size-from-host", True) and not sized_by_caller(elements)
-    extra = shlex.split(inp("extra-args"))
+    containers = inp("container-qemu-tool", "runner")
+    if containers not in ("runner", "pypi"):
+        raise Failure("container-qemu-tool must be runner or pypi, not "
+                      f"{containers!r}")
+    extra = absolute_paths(shlex.split(inp("extra-args")), Path.cwd())
     tool = op_install(base)
     state = {
         "state_file": str(state_path(base, stack)),
@@ -1241,7 +1598,9 @@ def op_up(base: Path) -> None:
         "fetch_dir": str(base / "action" / stack / "fetched"),
         "tool": tool["tool"],
         "version": tool["version"],
+        "sha": tool["sha"],
         "flavor": inp("flavor", "default"),
+        "fleet": {},
         "in_network": (in_container() if inp("in-network", "auto") == "auto"
                        else flag("in-network")),
         "layers": [],
@@ -1251,10 +1610,49 @@ def op_up(base: Path) -> None:
     action_dir.mkdir(parents=True, exist_ok=True)
     Path(state["images_dir"]).mkdir(parents=True, exist_ok=True)
     with group("Fleet settings"):
-        state["layers"] = fleet_layers(tool["python"], state["flavor"],
-                                       action_dir, elements)
-        say("layers: " + (" + ".join(state["layers"])
-                          or f"the {state['flavor']} flavor as shipped"))
+        state["layers"], own = fleet_layers(tool["python"], state["flavor"],
+                                            action_dir, elements)
+        say("layers: " + " + ".join(state["layers"]))
+        state["fleet"] = check_fleet(tool, state["layers"])
+        seeded = bool(inp("ssh-key-file"))
+        if not state["fleet"].get("backing_ref"):
+            if not seeded or flag("clean-overlays", True):
+                raise Failure(
+                    "the fleet names no <backing-ref>, the guest image to "
+                    "pull. To boot guest images already in images-dir "
+                    "instead, give ssh-key-file and set clean-overlays: "
+                    "false.")
+            say("no <backing-ref>: booting the guest images already in "
+                f"{state['images_dir']}")
+        seed_key(state, state["fleet"])
+        # Sizes the caller gave, by input or in a file of their own, are
+        # the caller's; the runner is only asked when nobody said.
+        sizing = inp("size-from-host", "auto").lower()
+        if sizing == "auto":
+            host_sizing = not (sized_by_caller(elements)
+                               or files_set_sizes(own))
+        else:
+            host_sizing = flag("size-from-host") and not sized_by_caller(elements)
+        say("guest size: " + ("derived from this runner" if host_sizing
+                              else "as the fleet XML has it"))
+        placed, package = container_source(tool["python"], stack_dir)
+        if containers == "pypi":
+            shutil.rmtree(stack_dir / "qemu", ignore_errors=True)
+            say("the stack's containers will install qemu-tool from PyPI")
+        else:
+            say(f"the stack's containers will run this qemu-tool ({placed})")
+        found = checkout_above(package, action_dir)
+        if found is not None and found != package.parent.parent:
+            # quick-start will find it too and hand the containers its
+            # qemu/ instead, whatever was installed or asked for.
+            warn(f"work-dir, or the qemu-tool on PATH, is inside the "
+                 f"qemu-minimal checkout at {found}. quick-start gives the "
+                 f"stack's containers {found}/qemu, not the qemu-tool "
+                 "installed. Keep work-dir outside the checkout.")
+        # quick-start re-reads every overlay it ever generated here, and
+        # only ever rewrites this one: an earlier fleet's login would
+        # outlive it. It is written again when the image names an account.
+        (stack_dir / "overlay-image-login.xml").unlink(missing_ok=True)
     # Recorded before anything starts, so the post step can clear up a stack
     # that got only part of the way.
     write_state(state)
@@ -1287,7 +1685,10 @@ def op_up(base: Path) -> None:
     command += extra
     with group("Boot the fleet"):
         subprocess.run(["df", "-h", state["images_dir"]], check=False)
-        run(command)
+        # Not from the workspace: quick-start looks for a qemu-minimal
+        # checkout above its working directory and, finding one, gives the
+        # containers that tree in place of the one just placed for them.
+        run(command, cwd=action_dir)
         if state["in_network"]:
             me = Path("/etc/hostname").read_text().strip()
             joined = quiet(["docker", "network", "connect",
@@ -1356,7 +1757,7 @@ def op_command(base: Path) -> None:
     if not arguments:
         raise Failure("operation: command needs `args`, the qemu-tool command "
                       "line without its first word, e.g. "
-                      "`gen-compose --xml fleet.xml --check`")
+                      "`gen-compose --xml fleet.xml --output-dir out`")
     tool = op_install(base)["tool"]
     result = run([tool, *arguments], check=False)
     if result.returncode != 0:

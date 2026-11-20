@@ -1,9 +1,10 @@
 # qemu-tool-action
 
-Boot QEMU guests with an emulated ROCm GPU, an RDMA NIC and NVMe inside a
-GitHub Actions job, run your tests in them, and have them torn down when the
-job ends. It drives [`qemu-tool`](https://github.com/sbates130272/qemu-minimal)
-2.x; no checkout of that repository is needed.
+Boot a fleet of QEMU guests inside a GitHub Actions job, each with emulated
+ROCm GPUs, RDMA NICs and NVMe, run your tests in them, and have them torn
+down when the job ends. The fleet is described by fleet XML: one that
+[`qemu-tool`](https://github.com/sbates130272/qemu-minimal) ships, or your
+own.
 
 ```yaml
 jobs:
@@ -11,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: sbates130272/qemu-tool-action@v2
         with:
@@ -24,15 +25,15 @@ jobs:
 
 That one step:
 
-1. installs `qemu-tool` from PyPI, makes `/dev/kvm` usable and installs
-   `oras` if the runner lacks it;
-2. pulls the published `rocm-golden` guest image and boots the fleet;
+1. installs `qemu-tool`, makes `/dev/kvm` usable and installs `oras` if the
+   runner lacks it;
+2. checks the fleet XML, pulls the guest image it names and boots the fleet;
 3. waits until every guest answers SSH, then loads the GPU driver in each;
 4. copies the checkout to `~/workspace` in each guest and runs the script
    there.
 
 A post step collects the logs and removes the stack, whether the job passed
-or not.
+or not. With no fleet named, as above, it is qemu-tool's default one.
 
 ## Requirements
 
@@ -44,25 +45,186 @@ or not.
   packages and create `/var/lib/qemu-tool`. Set `setup-host: false` on a
   runner you have prepared yourself.
 - A runner that can run `node24` actions. Hosted runners can.
-- About 30 GB free where the images go (`images-dir`).
-- Four vCPUs per guest: below that the guest's RDMA driver does not probe.
-  A standard hosted runner has four cores, which is one guest at par and two
-  guests oversubscribed two to one. Use `vm-count: 1` on a standard runner
-  and a larger runner for two or more.
+- Disk for the guest image; about 30 GB free for the default fleet
+  (`images-dir`).
+- Enough cores. The emulated RDMA NIC's driver does not probe in a guest
+  with fewer than four vCPUs, and a standard hosted runner has four cores:
+  one guest at par, two guests oversubscribed two to one. Use `vm-count: 1`
+  on a standard runner and a larger runner for two or more.
 
-## What is in the guest
+## Which fleet
 
-Each guest of the default fleet has one emulated gfx1250 GPU (served by
-rocjitsu), one rocm-ernic RDMA NIC, one NVMe namespace and one SDXI device.
-The guests share an L2 network, so RDMA works between them.
+| You give | The fleet is |
+| --- | --- |
+| nothing | qemu-tool's default fleet |
+| `flavor: <name>` | another fleet qemu-tool ships |
+| `xml: <files>` | your own |
 
-The guest is Ubuntu with a mainline 7.2 kernel on a 64 GiB virtual disk,
-logged in as `ubuntu` with passwordless `sudo` and outbound network access.
-Installed: build-essential, cmake, ninja-build, pkg-config, the autotools,
-git, python3-venv, pipx; rdma-core with its headers and libraries under
+On top of whichever it is, in this order: the files of `xml-overlay`, then
+`vm-count`, `vcpus`, `vmem` and the `fleet` lines. A later layer overrides
+the elements it sets and leaves the rest.
+
+```yaml
+# The default fleet, with two NVMe namespaces and two GPUs per guest.
+- uses: sbates130272/qemu-tool-action@v2
+  with:
+    vm-count: 1
+    fleet: |
+      vm-nvme: 2
+      rocjitsu-per-vm: 2
+```
+
+```yaml
+# A shipped flavor, changed by an overlay file kept in your repository.
+- uses: sbates130272/qemu-tool-action@v2
+  with:
+    flavor: helios
+    xml-overlay: ci/helios-small.xml
+```
+
+```yaml
+# A fleet of your own.
+- uses: sbates130272/qemu-tool-action@v2
+  with:
+    xml: ci/fleet.xml
+```
+
+### The shipped fleets
+
+`flavor` takes the name of any fleet the installed qemu-tool ships;
+`qemu-tool quick-start --help` lists them. qemu-tool 2.1.0 has:
+
+| `flavor` | Guests | Each guest has |
+| --- | --- | --- |
+| `default` | 2 | one gfx1250 GPU, one rocm-ernic RDMA NIC, one NVMe namespace, one SDXI device |
+| `mi355x` | 4 | 8 GPUs, 8 NICs and 8 PCIe switches |
+| `helios` | 1 | 4 GPUs, 8 NICs, one SDXI device |
+
+A flavor added after the qemu-tool you install is refused, with the names
+that version does have. qemu-minimal's `main` has a fourth, `xio`; reach it
+with `qemu-tool-ref`. This action boots a fleet and prepares its GPUs; it
+does not run the further guest setup some flavors have a playbook for.
+
+### A fleet of your own
+
+Start from
+[`examples/fleet-minimal.xml`](https://github.com/sbates130272/qemu-tool-action/blob/main/examples/fleet-minimal.xml),
+which is as small as a fleet gets, or from the fleet qemu-tool ships,
+[`qemu/stacks/rocm-golden.xml`](https://github.com/sbates130272/qemu-minimal/blob/main/qemu/stacks/rocm-golden.xml),
+which documents every element it uses. What qemu-tool requires of one:
+
+- **The container images:** `<qemu-ref>`, `<ernic-ref>` and
+  `<rocjitsu-ref>`. They are one build and have to stay one.
+- **A guest image:** `<backing-ref>`, pulled with `oras`, on a tag that does
+  not move. `latest` is refused.
+- **At least one NIC and one GPU per guest.** SDXI, NVMe, more NICs and
+  GPUs, and PCIe switches are optional; a guest with no NIC, or no GPU, is
+  not something qemu-tool renders.
+
+Before anything is pulled the action has qemu-tool read and render the
+fleet, so its refusals arrive in the first minute, in its own words:
+
+```text
+Error: fleet.xml: unknown element <devices>
+Error: <backing-ref> names a tag that moves
+Error: <ernic-per-vm> must be at least 1, got 0
+```
+
+**A fleet XML is tied to the qemu-tool that reads it.** Elements are added
+in new releases, and a version that does not know one refuses the file
+(`unknown element`) instead of ignoring it. An older file still reads on a
+newer qemu-tool. So when your XML uses something new, say which qemu-tool
+you need; see the next section.
+
+The `fleet` input is flat `element: value` lines. Anything with structure,
+such as the `<devices>` block that gives each NIC or GPU of a guest its own
+settings (newer than qemu-tool 2.1.0), goes in a file.
+
+What the action does for the guests depends on what the fleet and its guest
+image provide:
+
+| Feature | Needs |
+| --- | --- |
+| The GPU step (`gpu`) | `amdgpu-probe` in the guest image, as images baked by qemu-minimal have. A guest without it is left as booted, and the log says so. |
+| `wait-for: rdma`, `QT_RDMA_DEVICE` | rdma-core and the NIC's driver in the guest image, and four vCPUs. |
+| `QT_RDMA_IP` and the peers' | A guest image that addresses its NIC at boot, as qemu-minimal's do. The address is the one qemu-tool assigns the guest's NIC on the mesh. |
+| Logging in | A guest image published with `qemu-tool publish-qcow`, which carries its own key. For any other, `ssh-key-file` and `ssh-user`. |
+
+A guest image of your own that was not published that way: give
+`ssh-key-file` (a private key the image accepts) and `ssh-user`. To boot
+images already in `images-dir`, with no `<backing-ref>` at all, also set
+`clean-overlays: false`. Neither path is exercised by this action's own CI.
+
+A fleet of your own gets the default fleet's Grafana dashboards and log
+collection when `metrics: true`.
+
+## Which qemu-tool
+
+One of three inputs says. `qemu-tool-ref` cannot be combined with the
+other two; `qemu-tool-source` overrides `qemu-tool-version`.
+
+| Input | Installs |
+| --- | --- |
+| `qemu-tool-version` | A release from PyPI: `2.1.0`, a pip specifier such as `~=2.1`, or `latest`. |
+| `qemu-tool-ref` | qemu-minimal at a tag, a branch or a full commit SHA: `v2.1.0`, `main`, `fddac6f2c69e...`. |
+| `qemu-tool-source` | The `qemu/` directory of a checkout already on the runner. |
+
+With none, it is the newest 2.x release (`>=2.1,<3`).
+
+```yaml
+- uses: sbates130272/qemu-tool-action@v2
+  with:
+    qemu-tool-version: 2.1.0      # a release, exactly
+```
+
+```yaml
+- uses: sbates130272/qemu-tool-action@v2
+  with:
+    qemu-tool-ref: v2.1.0         # the same release, from its tag
+```
+
+```yaml
+- uses: sbates130272/qemu-tool-action@v2
+  with:
+    qemu-tool-ref: fddac6f2c69e0782228ead604f03d244ec065443   # a commit
+    xml: ci/fleet.xml              # using something not released yet
+```
+
+Which to use:
+
+- **A release, pinned** (`qemu-tool-version: 2.1.0`), for a job that should
+  not change until you change it. The fleet a release ships pins its
+  container images and guest image too, so this pins the whole stack.
+- **The default range**, to follow 2.x releases without touching your
+  workflow. A new release can change the default fleet's images.
+- **A ref**, for a fleet XML element or a flavor that is not in a release
+  yet, or to pin to a commit. A branch name moves; a tag or a SHA does not.
+  `qemu-tool-repository` names a fork. qemu-tool reports the version of the
+  last release it was cut from, so the `qemu-tool-sha` output is what
+  identifies a ref install.
+
+**The stack's containers run the same qemu-tool as the runner.** Each QEMU
+container runs `qemu-tool run-vm`, and left alone it installs the latest
+release from PyPI when it starts, whatever the runner has: a compose file
+rendered by one version and run by another. The action places the runner's
+own installed qemu-tool where the containers look for a source tree, so
+they build that. `container-qemu-tool: pypi` restores qemu-tool's own
+behaviour. The containers still need network access to PyPI at start, for
+`setuptools` and qemu-tool's one dependency.
+
+## The default fleet's guests
+
+This section describes the guest image the shipped fleets name. A fleet of
+your own has whatever its `<backing-ref>` has.
+
+Ubuntu with a mainline 7.2 kernel on a 64 GiB virtual disk, logged in as
+`ubuntu` with passwordless `sudo` and outbound network access. Installed:
+build-essential, cmake, ninja-build, pkg-config, the autotools, git,
+python3-venv, pipx; rdma-core with its headers and libraries under
 `/usr/local`; perftest (`ib_send_bw` and friends); nvme-cli, fio, pciutils;
 and the ROCm 10.2 runtime, hipFile and BLAS development packages.
-`rocminfo` is not installed.
+`rocminfo` is not installed. The guests share an L2 network, so RDMA works
+between them.
 
 Install anything else in `run`. Guests start from a fresh disk on every job,
 so nothing persists:
@@ -79,8 +241,9 @@ rdma-core the image was built with.
 more: `amdgpu` is blacklisted, and the one firmware file it needs is not in
 the image because it belongs to the rocjitsu build serving the device. The
 action supplies both (`gpu: true`, the default): it generates the firmware
-from the stack's own rocjitsu image, installs it in each guest and runs the
-image's `amdgpu-probe`, then waits for a GPU node in the KFD topology.
+from the stack's own rocjitsu image, for the generation the fleet's
+`<rocjitsu-config>` names, installs it in each guest and runs the image's
+`amdgpu-probe`, then waits for a GPU node in the KFD topology.
 `amdgpu-probe --status` in a guest prints which state it is in, and the
 `gpu` field of `vm-manifest` records it (`loaded` when usable).
 
@@ -88,7 +251,7 @@ image's `amdgpu-probe`, then waits for a GPU node in the KFD topology.
 
 | `operation` | What it does |
 | --- | --- |
-| `up` (default) | Install, boot a fleet, wait, bring up the GPU, then `copy`, `run` and `fetch` if given. Tears down at job end. |
+| `up` (default) | Install, check and boot a fleet, wait, bring up the GPU, then `copy`, `run` and `fetch` if given. Tears down at job end. |
 | `exec` | `copy`, `run` and `fetch` against the fleet an earlier `up` step booted. |
 | `down` | Collect logs and tear the fleet down now, e.g. before uploading the logs. |
 | `install` | Install `qemu-tool` and prepare the host, nothing else. Later steps call `qemu-tool` themselves. |
@@ -99,7 +262,8 @@ image's `amdgpu-probe`, then waits for a GPU node in the KFD topology.
 ### Two guests and an RDMA test between them
 
 The script runs on every guest at once. Each copy knows which guest it is
-and where its peers are, so one script can play both roles:
+and where its peers are, so one script can play both roles. Two guests want
+a runner with at least eight cores.
 
 ```yaml
 - uses: sbates130272/qemu-tool-action@v2
@@ -142,7 +306,7 @@ guest's RDMA device unusable until the fleet is restarted.
     fetch: |
       src/build/results
 
-- uses: actions/upload-artifact@v6
+- uses: actions/upload-artifact@v7
   if: always() && steps.tests.outputs.fetch-dir != ''
   with:
     name: test-results
@@ -161,38 +325,6 @@ guest's RDMA device unusable until the fleet is restarted.
 `fetch` runs whether the script passed or not, and puts each guest's copy
 in `<fetch-dir>/<guest-name>/`.
 
-### A different fleet
-
-`flavor` picks a shipped fleet, `xml` layers fleet XML files of your own,
-and `fleet` sets individual elements on top of either:
-
-```yaml
-- uses: sbates130272/qemu-tool-action@v2
-  with:
-    vm-count: 1
-    vcpus: 4
-    vmem: 8192
-    fleet: |
-      vm-nvme: 2
-      rocjitsu-per-vm: 2
-```
-
-```yaml
-- uses: sbates130272/qemu-tool-action@v2
-  with:
-    xml: |
-      ci/fleet.xml
-      ci/fleet-small.xml
-```
-
-The elements are those of
-[`qemu/stacks/rocm-golden.xml`](https://github.com/sbates130272/qemu-minimal/blob/main/qemu/stacks/rocm-golden.xml),
-which is also the file to copy for a fleet of your own.
-
-Guests are sized from the runner unless you size them: `vcpus` or `vmem`,
-or `vm-vcpus` or `vm-vmem` in `fleet`, turn that off. Sizes written inside
-an `xml` file need `size-from-host: false` to take effect.
-
 ### Keep the logs as an artifact
 
 The automatic teardown runs after every step, too late for an upload step.
@@ -205,7 +337,7 @@ Tear down explicitly first; the automatic one then finds nothing to do:
   with:
     operation: down
 
-- uses: actions/upload-artifact@v6
+- uses: actions/upload-artifact@v7
   if: always() && steps.down.outputs.logs-dir != ''
   with:
     name: fleet-logs
@@ -222,18 +354,21 @@ log and the end of each guest's `dmesg`.
 - uses: sbates130272/qemu-tool-action@v2
   with:
     operation: install
+    qemu-tool-version: 2.1.0
 
 - run: |
     qemu-tool check
     qemu-tool gen-compose --xml ci/fleet.xml --output-dir "$RUNNER_TEMP/stack"
 ```
 
+`--output-dir` matters for a fleet of your own: without it `gen-compose`
+targets the directory of a shipped stack.
+
 ```yaml
 - uses: sbates130272/qemu-tool-action@v2
   with:
     operation: command
-    args: gen-compose --xml qemu/stacks/rocm-golden.xml --check
-    qemu-tool-source: ./qemu
+    args: gen-compose --xml ci/fleet.xml --dry-run
 ```
 
 ## Inputs
@@ -243,25 +378,30 @@ All are optional.
 | Input | Default | |
 | --- | --- | --- |
 | `operation` | `up` | See the table above. |
-| **Install** | | |
-| `qemu-tool-version` | `>=2.1,<3` | A version, a pip specifier, or `latest`. See the note below. |
-| `qemu-tool-source` | | Path to the `qemu/` directory of a qemu-minimal checkout to install instead. |
+| **Which qemu-tool** | | One of the first three. |
+| `qemu-tool-version` | `>=2.1,<3` | A release from PyPI: a version, a pip specifier, or `latest`. |
+| `qemu-tool-ref` | | A tag, a branch or a full commit SHA of qemu-minimal. |
+| `qemu-tool-source` | | Path to the `qemu/` directory of a checkout on the runner. Installed from a copy; the checkout is not written to. |
+| `qemu-tool-repository` | `sbates130272/qemu-minimal` | Where `qemu-tool-ref` is fetched from: `owner/name` or a URL. |
+| `container-qemu-tool` | `runner` | `runner`: the stack's containers run the runner's qemu-tool. `pypi`: they install the latest release. |
 | `install` | `true` | `false` uses the `qemu-tool` already on PATH. |
 | `setup-host` | `true` | Open `/dev/kvm` to this user; install missing `oras`, `qemu-utils`, `zstd`, `ansible-core`, `git`, `openssh-client`. |
 | `oras-version` | `1.3.4` | Installed when the runner's is absent or older than 1.3.4. |
 | **Fleet** (`up`) | | |
-| `flavor` | `default` | `default`, `mi355x` or `helios`. |
-| `xml` | | Fleet XML files, one per line; later ones win. Replaces the flavor's file. |
+| `flavor` | `default` | A fleet qemu-tool ships. Not used when `xml` is given. |
+| `xml` | | A fleet of your own: fleet XML files, one per line; later ones win. |
+| `xml-overlay` | | Fleet XML files layered on the flavor or on `xml`; later ones win. |
 | `vm-count` | fleet's own | Number of guests; 2 for the default flavor. |
-| `vcpus`, `vmem` | sized from runner | Per guest; `vmem` in MiB. Either one turns `size-from-host` off. |
-| `fleet` | | Other fleet elements, `element: value` per line. |
-| `size-from-host` | `true` | Derive guest size from the runner (4 to 8 vCPUs, 4 to 8 GiB). |
+| `vcpus`, `vmem` | see `size-from-host` | Per guest; `vmem` in MiB. |
+| `fleet` | | Other fleet elements, `element: value` per line. Applied last. |
+| `size-from-host` | `auto` | `auto`: size guests from the runner (4 to 8 vCPUs, 4 to 8 GiB) unless `vcpus`, `vmem`, `fleet` or a file of yours sets a size. `true`: also override sizes in your files. `false`: never. |
 | `metrics` | `false` | Also start Prometheus, Grafana and log collection. |
 | `clean-overlays` | `true` | Fresh guest disks rather than ones an earlier job left. |
 | `wait-for` | `ssh` | `ssh`, `rdma` (also wait for `PORT_ACTIVE`), or `none`. |
 | `wait-timeout` | `900` | Seconds. |
 | `gpu` | `true` | Stage the GPU firmware and load `amdgpu` in each guest. Skipped with `wait-for: none`. |
-| `gpu-generation` | `gfx1250` | GPU generation the firmware is generated for. |
+| `gpu-generation` | from the fleet | GPU generation the firmware is generated for; read from `<rocjitsu-config>`, else `gfx1250`. |
+| `ssh-key-file`, `ssh-user` | the image's own | Key and account for a guest image that carries none to fetch. |
 | `in-network` | `auto` | Reach guests on the stack's Docker network; `auto` does so in a `container:` job. |
 | `teardown` | `always` | `never` leaves the fleet running at job end. |
 | `log-lines` | `40` | Lines of each container log printed at teardown. |
@@ -281,29 +421,28 @@ All are optional.
 | **`command`** | | |
 | `args` | | The command line, without `qemu-tool`. |
 
-`qemu-tool-version` pins the `qemu-tool` on the runner, which generates and
-drives the stack. Each guest's container installs the latest `qemu-tool`
-from PyPI when it starts, and needs network access to do so, unless
-`qemu-tool-source` names the `qemu/` directory of a full qemu-minimal
-checkout, in which case that checkout is used there too.
-
 ## Outputs
 
 | Output | |
 | --- | --- |
-| `vm-manifest` | JSON array, one object per guest: `name`, `index`, `ssh_host`, `ssh_port`, `username`, `ssh_key_file`, `ssh_cmd`, `rdma_ip`, `rdma_ips`, `rdma_device`, `gpu`. |
+| `vm-manifest` | JSON array, one object per guest: `name`, `index`, `ssh_host`, `ssh_port`, `username`, `ssh_key_file`, `ssh_cmd`, `rdma_ip`, `rdma_ips`, `nics`, `rdma_device`, `gpu`. |
 | `vm-names`, `vm-count` | Guest names, space separated; and how many. |
 | `ssh-config` | An ssh config naming every guest (and `vm1`, `vm2`, ...). |
 | `inventory` | An Ansible inventory of the guests. |
 | `key-file`, `key-dir` | The private key the guests accept, and its directory. |
 | `stack-dir`, `stack-name` | The generated compose stack. |
-| `fleet-xml` | The fleet XML layers the action passed to `quick-start`, one path per line. Empty when the flavor's shipped file is used unchanged. The overlays `quick-start` adds itself (host sizing, the images directory) are in `stack-dir` and not listed. |
+| `fleet-xml` | The fleet XML layers the fleet was booted from, lowest first, one path per line. |
 | `images-dir`, `logs-dir`, `fetch-dir` | |
-| `qemu-tool-version`, `qemu-tool-path` | |
+| `qemu-tool-version`, `qemu-tool-path` | The version as qemu-tool reports it, and where it is. |
+| `qemu-tool-sha`, `qemu-tool-checkout` | With `qemu-tool-ref`: the commit it resolved to, and the qemu-minimal checkout. Empty otherwise. |
 
 `up` sets all of them. `exec` sets `fetch-dir`, `down` sets `logs-dir`, and
-`install` and `command` set the two `qemu-tool-*` outputs. `rdma_device` is
-filled in only with `wait-for: rdma`.
+`install` and `command` set the four `qemu-tool-*` outputs.
+
+In a manifest entry, `rdma_ip` is the address of the NIC qemu-tool treats
+as the guest's own, the one on the mesh that reaches other guests;
+`rdma_ips` and `nics` (`index`, `mac`, `ip`) list every NIC. `rdma_device`
+is filled in only with `wait-for: rdma`.
 
 Later steps of the job also get `qemu-tool` and `oras` on PATH (nothing
 else is added to it) and two variables: `QEMU_TOOL_SSH_CONFIG`, and
@@ -316,7 +455,8 @@ stack from any directory.
 | --- | --- |
 | `QT_VM_NAME`, `QT_VM_INDEX` | This guest; indexes start at 1. |
 | `QT_VM_COUNT`, `QT_VM_NAMES` | The fleet. |
-| `QT_RDMA_IP` | This guest's RDMA address. |
+| `QT_RDMA_IP` | This guest's RDMA address on the mesh. |
+| `QT_NIC_IPS` | The address of every NIC this guest has. |
 | `QT_RDMA_DEVICE` | Its verbs device; empty unless the fleet was booted with `wait-for: rdma`. |
 | `QT_RDMA_IPS`, `QT_PEER_RDMA_IPS` | Every guest's address, and every other guest's. |
 | `QT_VM_<n>_NAME`, `QT_VM_<n>_RDMA_IP` | Guest *n*. |
@@ -329,13 +469,34 @@ fails if the script fails on any guest.
 
 ## Time and disk
 
-The long step is the pull: the guest image is about 2 GB to download and
-unpacks to about 8.4 GB, once per job however many guests there are, plus
-the container images of QEMU and the device servers. Each guest then adds
-an overlay that grows as it is written and one file per NVMe namespace. Set
-`timeout-minutes` on the job; qemu-tool's own one-guest boot check allows
-45. On a hosted runner the image is pulled on every job. On a self-hosted
-runner `images-dir` persists and the backing image is reused.
+This action's own CI boots one guest of the default fleet, runs a few
+checks in it and tears it down in three to four minutes on a hosted
+runner, the image pull included. Set `timeout-minutes` on the job all the
+same.
+
+The default fleet's guest image is a few gigabytes to pull and several more
+unpacked, once per job however many guests there are, plus the container
+images of QEMU and the device servers. Each guest then adds an overlay that
+grows as it is written and one file per NVMe namespace; qemu-tool asks for
+about 30 GB. On a hosted runner the image is pulled on every job. On a
+self-hosted runner `images-dir` persists and the backing image is reused.
+
+## Compatibility
+
+- **This action and qemu-tool.** `@v2` drives qemu-tool 2.x and is tested
+  against 2.1.0 and, on a schedule, against qemu-minimal's `main`. A new
+  2.x release needs nothing from you; a qemu-tool 3 would come with a new
+  major version of this action.
+- **Your fleet XML and qemu-tool.** Forward only: a file written for one
+  release reads on later ones, and a file using a newer element is refused
+  by an older release. If your XML needs a newer qemu-tool than the
+  default gives, say so with `qemu-tool-version` or `qemu-tool-ref`.
+- **Reproducibility.** Pin `qemu-tool-version` or give `qemu-tool-ref` a
+  tag or SHA. The shipped fleets pin their images, so that fixes the stack;
+  a fleet of your own pins what its own XML pins.
+- **`@v1`** wrapped qemu-tool 1.x and is not maintained. It installs the
+  latest qemu-tool unless told otherwise, which is 2.x, so a workflow still
+  on `@v1` has to set `qemu-tool-version` to a 1.x release; see below.
 
 ## Limits
 
@@ -386,9 +547,14 @@ guest's `dmesg` are written to `logs-dir` at teardown, and the last
 
 | Symptom | Cause and fix |
 | --- | --- |
+| `qemu-tool X cannot read this fleet: ... unknown element <...>` | Your fleet XML uses an element this qemu-tool does not have. Install a newer one with `qemu-tool-version` or `qemu-tool-ref`, or drop the element. |
+| `qemu-tool X cannot render this fleet` | qemu-tool's own reason follows: a guest image on a moving tag, a guest with no NIC or GPU, container images from different builds. |
+| `this qemu-tool ships no flavor ...` | The flavor is newer than the qemu-tool installed; the message lists the ones it has. |
+| `the fleet names no <backing-ref>` | A fleet of your own has to name its guest image; see A fleet of your own. |
 | `/dev/kvm does not exist on this runner` | The runner has no nested virtualisation. Use a GitHub-hosted Linux x64 runner or a self-hosted one with KVM; in a container job pass `--device /dev/kvm`. |
-| `<vm> never answered SSH` | The guest did not boot inside `wait-timeout`. A verbose SSH attempt and the end of the `qemu-<n>` container log are printed above the error. On an oversubscribed runner lower `vm-count`. |
-| `<vm> has no RDMA device with an active port` | The guest has fewer than 4 vCPUs (`vcpus`), or the NIC server died; see the `ernic-<n>` log. |
+| `<vm> never answered SSH` | The guest did not boot inside `wait-timeout`, or the key is not one its image accepts. A verbose SSH attempt and the end of the `qemu-<n>` container log are printed above the error. On an oversubscribed runner lower `vm-count`. |
+| `<vm> has no RDMA device with an active port` | The guest has fewer than 4 vCPUs (`vcpus`), or the NIC server died; see the log of its `ernic-<n>` container, `ernic-<guest>-<nic>` in a fleet with several NICs per guest. |
+| `the guest image has no ibv_devinfo` | `wait-for: rdma` on a guest image without rdma-core. Use `wait-for: ssh`. |
 | A guest dies mid-job with `vfio-user: timed out waiting for reply` | More vCPUs were allocated than the runner has cores, and the NIC mesh evicted a live node. Use `vm-count: 1` or a larger runner. |
 | `<vm>: amdgpu did not bind the emulated GPU` | The lines above it carry `amdgpu-probe --status` and the guest's `amdgpu` kernel messages. `gpu: false` boots without the GPU step. |
 | A warning that the images directory has less than about 30 GB free | Point `images-dir` at a larger disk. |
@@ -399,9 +565,13 @@ guest's `dmesg` are written to `logs-dir` at teardown, and the last
 
 ## Security
 
-The guest image is public, and so are the key and password that log in to
-it. The fleet publishes its ports on `127.0.0.1` only; do not change
-`publish-bind-addr` on a runner other machines can reach.
+The guest image the shipped fleets use is public, and so are the key and
+password that log in to it. A fleet publishes its ports on `127.0.0.1`
+only; do not change `publish-bind-addr` on a runner other machines can
+reach.
+
+`qemu-tool-ref` runs code from the repository and ref you name. Give it a
+full commit SHA, or a tag you trust not to move, rather than a branch.
 
 ## Migrating from v1
 
@@ -412,15 +582,17 @@ v2 is a different action rather than an update:
 | v1 | v2 |
 | --- | --- |
 | `operation: gen-vm` / `run-vm` / `gen-compose` / `compose` with per-flag inputs | `operation: command` with `args`, or `operation: install` and a `run:` step |
-| `env-file` | `xml` (fleet XML) and `fleet` |
+| `env-file` | `xml` (fleet XML), `xml-overlay` and `fleet` |
 | `stack`, `compose-profiles`, `compose-args` | `flavor` / `xml`; `metrics: true` for the metrics profile |
 | `wait-for-healthy` | `wait-for: ssh` (default) or `rdma` |
 | `vm-manifest` output | Same name; entries gain host, user, key, RDMA and GPU fields, and `image_path` is gone |
 | `vcpus`, `vmem`, `extra-args`, `wait-timeout` | Same names, new meaning: the size of every guest, flags for `quick-start up`, and the wait for the guests (default 900 s, was 120) |
 
-A workflow that stays on `@v1` must now set `qemu-tool-version` to a 1.x
+A workflow that stays on `@v1` must set `qemu-tool-version` to a 1.x
 release: v1 installs the latest `qemu-tool` by default, which is 2.x, and
-v1's command lines no longer match it.
+v1's command lines no longer match it. That pins the runner only. The
+containers of a 1.x stack install the latest release themselves, so a v1
+fleet that starts containers is not kept working by the pin; move to `@v2`.
 
 ## Versioning
 
@@ -434,7 +606,9 @@ how a release is cut is in
 
 ```bash
 python3 -m unittest discover -s tests   # no runner, no guest
-tests/smoke.sh                          # installs qemu-tool into a scratch dir
+tests/smoke.sh                          # installs qemu-tool into a scratch dir,
+                                        # renders every fleet it ships
+tests/smoke.sh ../qemu-minimal/qemu     # the same, against a checkout
 tests/test_release.sh                   # the release workflow's tag logic
 ```
 

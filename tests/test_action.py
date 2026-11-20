@@ -87,6 +87,23 @@ class Inventory(unittest.TestCase):
         self.assertEqual(len(hosts), 1)
         self.assertEqual(hosts[0]["nic_ips"],
                          ["192.168.100.11", "192.168.100.12"])
+        self.assertEqual(hosts[0]["nics"][1], {
+            "index": "2", "mac": "72:6f:63:6d:00:02", "ip": "192.168.100.12"})
+        # The guest's own keys are not taken for a NIC's.
+        self.assertEqual(hosts[0]["ansible_port"], "2322")
+        self.assertEqual(hosts[0]["fleet_guest_ip"], "192.168.100.11")
+
+    def test_the_guests_own_nic_is_the_one_qemu_tool_names(self):
+        """Not simply the first: the first NIC may be off the mesh."""
+        text = INVENTORY_MULTI_NIC.replace(
+            "fleet_guest_ip: 192.168.100.11", "fleet_guest_ip: 192.168.100.12")
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "fleet-inventory.yml").write_text(text)
+            vm = qta.build_manifest({"stack_dir": tmp, "key_dir": tmp,
+                                     "stack_name": "x", "in_network": False})[0]
+        self.assertEqual(vm["rdma_ip"], "192.168.100.12")
+        self.assertEqual(vm["rdma_ips"], ["192.168.100.11", "192.168.100.12"])
+        self.assertEqual(len(vm["nics"]), 2)
 
     def test_manifest_from_a_stack_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -143,30 +160,218 @@ class Overlay(unittest.TestCase):
             qta.overlay_elements()
 
 
-class Requirement(unittest.TestCase):
-    def test_forms(self):
-        for given, want in (("", ["qemu-tool>=2.1,<3"]),
-                            ("latest", ["qemu-tool"]),
-                            ("2.1.0", ["qemu-tool==2.1.0"]),
-                            ("~=2.1", ["qemu-tool~=2.1"])):
-            with mock.patch.dict(os.environ, {}, clear=True), \
-                    inputs(qemu_tool_version=given):
-                self.assertEqual(qta.requirement(), want)
+class InstallSource(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        clear = mock.patch.dict(os.environ, {}, clear=True)
+        clear.start()
+        self.addCleanup(clear.stop)
 
-    def test_source_must_be_a_project(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            with inputs(qemu_tool_source=tmp), self.assertRaises(qta.Failure):
-                qta.requirement()
-            Path(tmp, "pyproject.toml").write_text("")
-            with inputs(qemu_tool_source=tmp):
-                self.assertEqual(qta.requirement(),
-                                 ["-e", str(Path(tmp).resolve())])
+    def test_pypi_forms(self):
+        for given, want in (("", "qemu-tool>=2.1,<3"), ("latest", "qemu-tool"),
+                            ("2.1.0", "qemu-tool==2.1.0"),
+                            ("~=2.1", "qemu-tool~=2.1")):
+            with inputs(qemu_tool_version=given):
+                source = qta.install_source(self.base)
+            self.assertEqual((source["kind"], source["spec"]), ("pypi", [want]))
+
+    def test_source_is_installed_from_a_copy(self):
+        src = self.base / "checkout" / "qemu"
+        (src / "build").mkdir(parents=True)
+        with inputs(qemu_tool_source=str(src)), self.assertRaises(qta.Failure):
+            qta.install_source(self.base)
+        (src / "pyproject.toml").write_text("")
+        with inputs(qemu_tool_source=str(src)):
+            source = qta.install_source(self.base)
+        staged = Path(source["spec"][0])
+        self.assertEqual(source["kind"], "source")
+        self.assertNotEqual(staged, src)
+        self.assertTrue((staged / "pyproject.toml").is_file())
+        # Not editable, and nothing a build left behind comes along.
+        self.assertNotIn("-e", source["spec"])
+        self.assertFalse((staged / "build").exists())
+
+    def test_a_ref_excludes_the_other_two(self):
+        for other in ({"qemu_tool_version": "2.1.0"},
+                      {"qemu_tool_source": "/somewhere"}):
+            with inputs(qemu_tool_ref="main", **other), \
+                    self.assertRaises(qta.Failure) as ctx:
+                qta.install_source(self.base)
+            self.assertIn("qemu-tool-ref and qemu-tool-", str(ctx.exception))
+
+    def test_a_source_still_overrides_a_version(self):
+        """What 2.0.0 documented; a workflow relying on it keeps working."""
+        import contextlib
+        import io
+        src = self.base / "checkout" / "qemu"
+        src.mkdir(parents=True)
+        (src / "pyproject.toml").write_text("")
+        out = io.StringIO()
+        with inputs(qemu_tool_source=str(src), qemu_tool_version="2.1.0"), \
+                contextlib.redirect_stdout(out):
+            source = qta.install_source(self.base)
+        self.assertEqual(source["kind"], "source")
+        self.assertIn("::warning::", out.getvalue())
+
+    def test_the_actions_own_directories_cannot_be_a_stack(self):
+        self.assertFalse(qta.STACK_NAME.match(qta.ACTION_OWN.name))
+
+    def test_extra_args_paths_are_taken_against_the_workspace(self):
+        got = qta.absolute_paths(
+            ["--xml", "ci/o.xml", "--report-dir=out", "--yes", "--xml",
+             "/abs/x.xml", "--rdma-duration", "5"], Path("/ws"))
+        self.assertEqual(got, ["--xml", "/ws/ci/o.xml", "--report-dir=/ws/out",
+                               "--yes", "--xml", "/abs/x.xml",
+                               "--rdma-duration", "5"])
+
+    def test_a_checkout_above_is_found_the_way_quick_start_finds_it(self):
+        tree = self.base / "co"
+        (tree / "ansible" / "playbooks").mkdir(parents=True)
+        (tree / "ansible" / "playbooks" / "vm-quickstart.yml").write_text("")
+        (tree / "qemu").mkdir()
+        (tree / "qemu" / "pyproject.toml").write_text("")
+        inside = tree / ".work" / "action" / "ci"
+        inside.mkdir(parents=True)
+        self.assertEqual(qta.checkout_above(inside), tree.resolve())
+        self.assertIsNone(qta.checkout_above(self.base / "elsewhere"))
+
+    def test_ref_is_fetched_at_a_tag_a_branch_or_a_commit(self):
+        import subprocess
+        origin = self.base / "origin"
+        (origin / "qemu").mkdir(parents=True)
+        (origin / "qemu" / "pyproject.toml").write_text("[project]\n")
+        git = ["git", "-C", str(origin), "-c", "user.name=t",
+               "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false",
+               "-c", "tag.gpgsign=false"]
+        subprocess.run(["git", "init", "-q", "-b", "main", str(origin)], check=True)
+        subprocess.run(git + ["add", "-A"], check=True)
+        subprocess.run(git + ["commit", "-q", "-m", "one"], check=True)
+        subprocess.run(git + ["tag", "v9.9.9"], check=True)
+        sha = subprocess.run(git + ["rev-parse", "HEAD"], check=True,
+                             capture_output=True, text=True).stdout.strip()
+        import contextlib
+        import io
+        for ref in ("v9.9.9", "main"):
+            with inputs(qemu_tool_ref=ref,
+                        qemu_tool_repository=f"file://{origin}"), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                source = qta.install_source(self.base)
+            self.assertEqual((source["kind"], source["sha"]), ("ref", sha))
+            self.assertTrue((Path(source["spec"][0]) / "pyproject.toml").is_file())
+            self.assertTrue((Path(source["checkout"]) / "qemu").is_dir())
+        with inputs(qemu_tool_ref="no-such-ref",
+                    qemu_tool_repository=f"file://{origin}"), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                self.assertRaises(qta.Failure):
+            qta.install_source(self.base)
+
+    def test_repository_names(self):
+        self.assertEqual(qta.repository_url("o/r"), "https://github.com/o/r.git")
+        self.assertEqual(qta.repository_url("https://h/x.git"), "https://h/x.git")
+        self.assertEqual(qta.repository_url("git@h:o/r.git"), "git@h:o/r.git")
+
+
+class Fleet(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        clear = mock.patch.dict(os.environ, {}, clear=True)
+        clear.start()
+        self.addCleanup(clear.stop)
+
+    def xml(self, name, body):
+        path = self.dir / name
+        path.write_text(f'<fleet xmlns="{qta.NS_FLEET}">{body}</fleet>')
+        return str(path)
+
+    def layers(self, **given):
+        import contextlib
+        import io
+        with inputs(**given), contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(qta, "packaged_fleet",
+                                  return_value=Path("/shipped/flavor.xml")):
+            return qta.fleet_layers("python", given.get("flavor", "default"),
+                                    self.dir, qta.overlay_elements())
+
+    def test_a_shipped_flavor_with_an_overlay_file_and_inputs(self):
+        over = self.xml("small.xml", "<vm-count>1</vm-count>")
+        layers, own = self.layers(xml_overlay=over, vcpus="4")
+        self.assertEqual(layers, ["/shipped/flavor.xml", over,
+                                  str(self.dir / "overlay.xml")])
+        self.assertEqual(own, [over])
+
+    def test_a_fleet_of_your_own_replaces_the_flavor(self):
+        mine = self.xml("mine.xml", "<vm-count>3</vm-count>")
+        layers, own = self.layers(xml=mine, flavor="helios")
+        self.assertEqual(layers, [mine])
+        self.assertEqual(own, [mine])
+
+    def test_the_shipped_fleet_alone_is_still_named(self):
+        self.assertEqual(self.layers()[0], ["/shipped/flavor.xml"])
+
+    def test_sizes_in_the_callers_files(self):
+        sized = self.xml("sized.xml", "<vm-vcpus>8</vm-vcpus>")
+        plain = self.xml("plain.xml", "<vm-count>2</vm-count>")
+        self.assertTrue(qta.files_set_sizes([plain, sized]))
+        self.assertFalse(qta.files_set_sizes([plain, "/nonexistent.xml"]))
+
+    def test_gpu_generation(self):
+        fleet = {"fleet": {"rocjitsu_config": "gfx1250_mi455x.json"}}
+        self.assertEqual(qta.gpu_generation(fleet), "gfx1250")
+        self.assertEqual(qta.gpu_generation(
+            {"fleet": {"rocjitsu_config": "/etc/x/gfx950_mi300.json"}}), "gfx950")
+        self.assertEqual(qta.gpu_generation({"fleet": {}}), "gfx1250")
+        self.assertEqual(qta.gpu_generation({}), "gfx1250")
+        with inputs(gpu_generation="gfx908"):
+            self.assertEqual(qta.gpu_generation(fleet), "gfx908")
+
+    def test_seeding_a_key_of_your_own(self):
+        import contextlib
+        import io
+        import shutil
+        import subprocess
+        if shutil.which("ssh-keygen") is None:
+            self.skipTest("no ssh-keygen")
+        key = self.dir / "mykey"
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f",
+                        str(key)], check=True)
+        private = key.read_text()
+        state = {"key_dir": str(self.dir / "keys"),
+                 "images_dir": str(self.dir / "images")}
+        stale = self.dir / "images" / "keys" / "quickstart_id_rsa"
+        stale.parent.mkdir(parents=True)
+        stale.write_text("old")
+        with inputs(ssh_key_file=str(key), ssh_user="tester"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            qta.seed_key(state, {"backing_ref": "reg/img:v1"})
+        keys = self.dir / "keys"
+        self.assertEqual((keys / "id_rsa").read_text(), private)
+        self.assertEqual((keys / "id_rsa").stat().st_mode & 0o777, 0o600)
+        # What makes quick-start skip its own fetch: the same image, recorded.
+        self.assertEqual((keys / "image-ref").read_text().strip(), "reg/img:v1")
+        self.assertEqual(qta.image_username(keys), "tester")
+        self.assertFalse(stale.exists())
+        with inputs(ssh_user="tester"), self.assertRaises(qta.Failure):
+            qta.seed_key(state, {})
+        # The public half given by mistake, or a key with a passphrase, is
+        # refused here, where the reason can still be said.
+        locked = self.dir / "locked"
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "secret",
+                        "-f", str(locked)], check=True)
+        for bad in (f"{key}.pub", str(locked)):
+            with inputs(ssh_key_file=bad), self.assertRaises(qta.Failure) as ctx:
+                qta.seed_key(state, {})
+            self.assertIn("not a private key", str(ctx.exception))
 
 
 VMS = [{"name": f"g-{i}", "index": i, "ssh_host": "127.0.0.1",
         "ssh_port": 2221 + i, "username": "ubuntu",
         "ssh_key_file": "/k/id_rsa", "ssh_cmd": "",
-        "rdma_ip": f"192.168.100.{10 + i}", "rdma_ips": [],
+        "rdma_ip": f"192.168.100.{10 + i}",
+        "rdma_ips": [f"192.168.100.{10 + i}"], "nics": [],
         "rdma_device": "rocm-rdma-ernic0", "gpu": "loaded"}
        for i in (1, 2, 3)]
 
@@ -266,7 +471,7 @@ class Plumbing(unittest.TestCase):
                 declared.add(line.strip().rstrip(":"))
         import re
         source = (root / "qemu_tool_action.py").read_text()
-        used = set(re.findall(r'(?:inp|flag|lines_of|whole_number)\(\s*"([a-z-]+)"', source))
+        used = set(re.findall(r'(?:inp|flag|lines_of|whole_number|existing)\(\s*"([a-z-]+)"', source))
         used |= {"run", "vm-count", "vcpus", "vmem"}  # read raw; in a loop
         self.assertEqual(declared, used)
 
@@ -409,15 +614,14 @@ class State(unittest.TestCase):
 class Install(unittest.TestCase):
     def test_reuse_rules(self):
         job = "7:1:build"
-        same = job + "\nqemu-tool>=2.1,<3"
-        other = job + "\nqemu-tool==2.1.0"
-        self.assertTrue(qta.reusable(same, same, asked=True))
-        # exec/down name no version: never reinstall under a running fleet.
-        self.assertTrue(qta.reusable(other, same, asked=False))
-        self.assertFalse(qta.reusable(other, same, asked=True))
-        self.assertFalse(qta.reusable("8:1:build\nx", "7:1:build\nx", asked=False))
+        made = {"job": job, "label": "pypi qemu-tool>=2.1,<3"}
+        self.assertTrue(qta.reusable(made, job, True, "pypi qemu-tool>=2.1,<3"))
+        # A step that names no version: never reinstall under a fleet.
+        self.assertTrue(qta.reusable(made, job, False, ""))
+        self.assertFalse(qta.reusable(made, job, True, "pypi qemu-tool==2.1.0"))
+        self.assertFalse(qta.reusable(made, "8:1:build", False, ""))
         # Outside a runner there is no job to belong to.
-        self.assertFalse(qta.reusable("::\nx", "::\nx", asked=False))
+        self.assertFalse(qta.reusable({"job": "::", "label": "x"}, "::", False, ""))
 
 
 class Reporting(unittest.TestCase):
