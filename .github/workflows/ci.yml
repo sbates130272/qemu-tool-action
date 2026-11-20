@@ -35,7 +35,7 @@ jobs:
     name: Lint and unit tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Syntax
         run: |
@@ -61,7 +61,7 @@ jobs:
     name: install and command
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Note the runner's python3
         run: echo "PY_BEFORE=$(command -v python3)" >> "$GITHUB_ENV"
@@ -112,7 +112,7 @@ jobs:
       options: >-
         -v /var/lib/qemu-tool:/var/lib/qemu-tool
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Note the image's python3
         run: echo "PY_BEFORE=$(command -v python3)" >> "$GITHUB_ENV"
@@ -153,9 +153,9 @@ jobs:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           repository: sbates130272/qemu-minimal
           path: qemu-minimal
@@ -183,7 +183,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # One guest: four vCPUs is the RDMA driver's floor and a hosted runner
       # has four cores.
@@ -288,7 +288,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: up, and RDMA from the second guest to the first
         uses: ./
