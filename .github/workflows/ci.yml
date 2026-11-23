@@ -5,11 +5,6 @@ name: qemu-tool-action - CI
 # commit here.
 on:
   workflow_dispatch:
-    inputs:
-      two-guests:
-        description: Also boot two guests and run RDMA between them
-        type: boolean
-        default: false
   pull_request:
     branches:
       - main
@@ -51,7 +46,14 @@ jobs:
       - name: Unit tests
         run: python3 -m unittest discover -s tests -v
 
-      - name: Entry point, without a runner
+      # Twice: the default range now reaches qemu-tool 3, and 2.1 is the
+      # oldest release the action says it drives.
+      - name: Entry point, without a runner, on the default qemu-tool
+        run: tests/smoke.sh
+
+      - name: The same, on qemu-tool 2.1.0
+        env:
+          QEMU_TOOL_VERSION: 2.1.0
         run: tests/smoke.sh
 
       - name: Release logic, without a release
@@ -146,10 +148,19 @@ jobs:
           operation: command
           args: run-vm --vm-name ci-test --dry-run --no-kvm
 
-  # A release pinned by tag: what `qemu-tool-ref` is for. No guest.
+  # A release pinned by tag: what `qemu-tool-ref` is for. No guest. One of
+  # each major version the action drives.
   ref:
-    name: install from a tag of qemu-minimal
+    name: install from tag ${{ matrix.ref }} of qemu-minimal
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - ref: v2.1.0
+            version: 2.1.0
+          - ref: v3.0.0
+            version: 3.0.0
     steps:
       - uses: actions/checkout@v7
 
@@ -158,16 +169,17 @@ jobs:
         uses: ./
         with:
           operation: install
-          qemu-tool-ref: v2.1.0
+          qemu-tool-ref: ${{ matrix.ref }}
 
       - name: The tag, its commit, and a checkout to read
         env:
           VERSION: ${{ steps.install.outputs.qemu-tool-version }}
           SHA: ${{ steps.install.outputs.qemu-tool-sha }}
           CHECKOUT: ${{ steps.install.outputs.qemu-tool-checkout }}
+          WANT: ${{ matrix.version }}
         run: |
           set -eu
-          [ "$VERSION" = 2.1.0 ]
+          [ "$VERSION" = "$WANT" ]
           [ "${#SHA}" = 40 ]
           [ "$(git -C "$CHECKOUT" rev-parse HEAD)" = "$SHA" ]
           test -f "$CHECKOUT/qemu/stacks/rocm-golden.xml"
@@ -179,8 +191,8 @@ jobs:
         uses: ./
         with:
           operation: install
-          qemu-tool-ref: v2.1.0
-          qemu-tool-version: 2.1.0
+          qemu-tool-ref: ${{ matrix.ref }}
+          qemu-tool-version: ${{ matrix.version }}
 
       - name: It was refused
         env:
@@ -236,6 +248,12 @@ jobs:
         with:
           xml-overlay: examples/overlay-one-guest.xml
           wait-for: rdma
+          # The opt-in inputs, on one guest. boot-own below leaves them all
+          # at their defaults.
+          gpu: required
+          ssh-aliases: guest guest{index}
+          diagnostics: true
+          stack-timeout: 1500
           copy: |
             tests:action-tests
           fetch: |
@@ -267,10 +285,13 @@ jobs:
           m = json.load(sys.stdin)
           assert len(m) == 1 and m[0]["rdma_device"], m
           assert m[0]["gpu"] == "loaded", m
+          assert m[0]["ssh_aliases"] == ["guest", "guest1", "vm1"], m
           print(m[0]["ssh_cmd"])'
           [ "$COUNT" = 1 ]
           grep -q 1dd8 "$FETCHED/$NAMES/results/lspci.txt"
-          ssh -F "$QEMU_TOOL_SSH_CONFIG" vm1 uname -r
+          for alias in vm1 guest guest1 ci-1; do
+            ssh -F "$QEMU_TOOL_SSH_CONFIG" "$alias" uname -r
+          done
           [ "$NAMES" = ci-1 ]
           qemu-tool ssh "$NAMES" -- true
           qemu-tool compose ps
@@ -284,6 +305,9 @@ jobs:
           echo "runner: $(qemu-tool --version); container: $inside"
           [ "$inside" = "$(qemu-tool --version)" ]
           docker exec ci-qemu-1-1 test -d /qemu-tool-src/qemu/qemu_tool
+          # This job names no qemu-tool, so it boots what a caller who names
+          # none gets: the newest release the default range allows, 3.x.
+          qemu-tool --version | grep -E '^qemu-tool 3\.'
 
       - name: exec
         uses: ./
@@ -326,6 +350,22 @@ jobs:
           left=$(docker ps -q --filter label=com.docker.compose.project=ci | wc -l)
           [ "$left" -eq 0 ]
 
+      # `diagnostics: true` was given to `up`; `down` took it from there.
+      # No metrics profile here, so the render holds no credential to
+      # redact; redaction is held by the unit tests.
+      - name: The diagnostics were collected
+        env:
+          LOGS: ${{ steps.down.outputs.logs-dir }}
+        run: |
+          set -eu
+          cat "$LOGS/diagnostics/NOTES.txt"
+          for f in dmesg lspci lsblk lsmod module-parameters; do
+            test -s "$LOGS/diagnostics/ci-1/$f.txt"
+          done
+          grep -q 'Kernel driver in use: ionic' "$LOGS/diagnostics/ci-1/lspci.txt"
+          grep -q '^amdgpu/' "$LOGS/diagnostics/ci-1/module-parameters.txt"
+          grep -q 'qemu-1' "$LOGS/diagnostics/compose-config.yml"
+
       - name: Upload logs
         if: always() && steps.down.outputs.logs-dir != ''
         uses: actions/upload-artifact@v7
@@ -336,10 +376,15 @@ jobs:
 
   # A fleet XML of the caller's own, with qemu-tool pinned to a tag of
   # qemu-minimal: the two things a downstream project is most likely to set.
+  # On each major version, with the one example file: it has to read on both.
   boot-own:
-    name: Boot a fleet of your own, from a tag
+    name: Boot a fleet of your own, from tag ${{ matrix.ref }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        ref: [v2.1.0, v3.0.0]
     steps:
       - uses: actions/checkout@v7
 
@@ -347,7 +392,7 @@ jobs:
         id: fleet
         uses: ./
         with:
-          qemu-tool-ref: v2.1.0
+          qemu-tool-ref: ${{ matrix.ref }}
           stack-name: own
           xml: examples/fleet-minimal.xml
           xml-overlay: examples/overlay-one-guest.xml
@@ -388,42 +433,127 @@ jobs:
         if: always() && steps.down.outputs.logs-dir != ''
         uses: actions/upload-artifact@v7
         with:
-          name: fleet-logs-own
+          name: fleet-logs-own-${{ matrix.ref }}
           path: ${{ steps.down.outputs.logs-dir }}
           if-no-files-found: ignore
 
-  # By hand only: two four-vCPU guests on a four-core runner are
-  # oversubscribed two to one, which the NIC mesh does not always survive.
+  # Two guests, which is what a consumer testing RDMA between guests boots.
+  # On every event, pull requests included: it is the only job that runs a
+  # script on several guests at once and moves bytes between them. Two
+  # four-vCPU guests on a four-core runner are oversubscribed two to one;
+  # other projects' two-guest CI runs that way.
   boot-two:
-    name: Boot two guests (manual)
-    if: github.event_name == 'workflow_dispatch' && inputs.two-guests
+    name: Boot two guests
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
 
+      # -F: perftest's CPU-frequency calibration is noisy on a busy host,
+      # and without it a run that moved every byte can still exit 1.
       - name: up, and RDMA from the second guest to the first
+        id: fleet
         uses: ./
         with:
           vm-count: 2
           wait-for: rdma
+          gpu: required
+          ssh-aliases: guest guest{index}
+          diagnostics: true
+          stack-timeout: 1800
           run: |
             [ "$QT_VM_COUNT" = 2 ]
             [ -n "$QT_PEER_RDMA_IPS" ]
             if [ "$QT_VM_INDEX" = 1 ]; then
-              ib_send_bw -d "$QT_RDMA_DEVICE" --iters 200
+              ib_send_bw -F -d "$QT_RDMA_DEVICE" --iters 200
             else
               sleep 10
-              ib_send_bw -d "$QT_RDMA_DEVICE" --iters 200 "$QT_VM_1_RDMA_IP"
+              ib_send_bw -F -d "$QT_RDMA_DEVICE" --iters 200 "$QT_VM_1_RDMA_IP"
             fi
+
+      - name: The outputs describe two guests
+        env:
+          MANIFEST: ${{ steps.fleet.outputs.vm-manifest }}
+          COUNT: ${{ steps.fleet.outputs.vm-count }}
+          NAMES: ${{ steps.fleet.outputs.vm-names }}
+          INVENTORY: ${{ steps.fleet.outputs.inventory }}
+        run: |
+          set -eu
+          [ "$COUNT" = 2 ]
+          [ "$(echo "$NAMES" | wc -w)" = 2 ]
+          echo "$MANIFEST" | python3 -c '
+          import json, sys
+          m = json.load(sys.stdin)
+          assert [vm["index"] for vm in m] == [1, 2], m
+          assert m[0]["ssh_aliases"] == ["guest", "guest1", "vm1"], m
+          assert m[1]["ssh_aliases"] == ["guest2", "vm2"], m
+          for vm in m:
+              assert vm["gpu"] == "loaded" and vm["rdma_device"], vm
+              assert vm["rdma_ip"], vm
+          assert m[0]["ssh_port"] != m[1]["ssh_port"], m
+          assert m[0]["rdma_ip"] != m[1]["rdma_ip"], m'
+          hosts=$(ansible-inventory -i "$INVENTORY" --list | python3 -c '
+          import json, sys
+          print(len(json.load(sys.stdin)["_meta"]["hostvars"]))')
+          [ "$hosts" = 2 ]
+
+      # Every alias resolves to the guest it should and that guest answers,
+      # with its RDMA port active and its own address on the NIC.
+      - name: Both guests answer to their names and aliases
+        env:
+          MANIFEST: ${{ steps.fleet.outputs.vm-manifest }}
+        run: |
+          set -eu
+          echo "$MANIFEST" | python3 -c '
+          import json, sys
+          for vm in json.load(sys.stdin):
+              for alias in [vm["name"], *vm["ssh_aliases"]]:
+                  print(alias, vm["ssh_port"], vm["rdma_device"], vm["rdma_ip"])
+          ' > "$RUNNER_TEMP/aliases"
+          cat "$RUNNER_TEMP/aliases"
+          [ "$(wc -l < "$RUNNER_TEMP/aliases")" = 7 ]
+          while read -r alias port device address; do
+            got=$(ssh -n -F "$QEMU_TOOL_SSH_CONFIG" -G "$alias" | awk '$1 == "port" {print $2}')
+            [ "$got" = "$port" ] || { echo "::error::$alias resolves to port $got, not $port"; exit 1; }
+            ssh -n -F "$QEMU_TOOL_SSH_CONFIG" "$alias" \
+              "ibv_devinfo -d $device | grep -q PORT_ACTIVE && ip -4 -o addr show | grep -qw $address" \
+              || { echo "::error::$alias: no active RDMA port, or not $address"; exit 1; }
+          done < "$RUNNER_TEMP/aliases"
 
       - name: down
         id: down
-        if: always()
-        continue-on-error: true
+        if: always() && steps.fleet.outputs.stack-dir != ''
         uses: ./
         with:
           operation: down
+
+      - name: Nothing is left running
+        if: always()
+        run: |
+          left=$(docker ps -q --filter label=com.docker.compose.project=ci | wc -l)
+          [ "$left" -eq 0 ]
+
+      - name: Teardown collected the logs and both guests' diagnostics
+        env:
+          LOGS: ${{ steps.down.outputs.logs-dir }}
+          NAMES: ${{ steps.fleet.outputs.vm-names }}
+        run: |
+          set -eu
+          ls -R "$LOGS"
+          cat "$LOGS/diagnostics/NOTES.txt"
+          test -s "$LOGS/docker-ps.txt"
+          for n in 1 2; do
+            test -s "$LOGS/ci-qemu-$n-1.log"
+            test -s "$LOGS/ci-ernic-$n-1.log"
+          done
+          for name in $NAMES; do
+            test -s "$LOGS/guest-$name-dmesg.log"
+            for f in dmesg lspci lsblk lsmod module-parameters; do
+              test -s "$LOGS/diagnostics/$name/$f.txt"
+            done
+            grep -q 'Kernel driver in use: ionic' "$LOGS/diagnostics/$name/lspci.txt"
+          done
+          grep -q 'qemu-2' "$LOGS/diagnostics/compose-config.yml"
 
       - name: Upload logs
         if: always() && steps.down.outputs.logs-dir != ''

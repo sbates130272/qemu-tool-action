@@ -119,6 +119,8 @@ class Inventory(unittest.TestCase):
         # The image, not the inventory, says which account exists in it.
         self.assertEqual(manifest[0]["username"], "tester")
         self.assertEqual(manifest[1]["rdma_ip"], "192.168.100.12")
+        # Documented in vm-manifest, so there before any alias is assigned.
+        self.assertEqual([v["ssh_aliases"] for v in manifest], [[], []])
         json.dumps(manifest)
 
 
@@ -170,7 +172,7 @@ class InstallSource(unittest.TestCase):
         self.addCleanup(clear.stop)
 
     def test_pypi_forms(self):
-        for given, want in (("", "qemu-tool>=2.1,<3"), ("latest", "qemu-tool"),
+        for given, want in (("", "qemu-tool>=2.1,<4"), ("latest", "qemu-tool"),
                             ("2.1.0", "qemu-tool==2.1.0"),
                             ("~=2.1", "qemu-tool~=2.1")):
             with inputs(qemu_tool_version=given):
@@ -312,6 +314,50 @@ class Fleet(unittest.TestCase):
     def test_the_shipped_fleet_alone_is_still_named(self):
         self.assertEqual(self.layers()[0], ["/shipped/flavor.xml"])
 
+    REMOVED_IN_3 = ("qemu-digest", "ernic-digest", "rocjitsu-digest",
+                    "backing-digest", "domain-pattern", "prom-port",
+                    "loki-port", "vm-backing-shared", "ernic-subnet",
+                    "ernic-mac-prefix")
+
+    def test_what_the_action_writes_and_shows_reads_on_qemu_tool_3(self):
+        """qemu-tool 3 refuses a fleet that sets one of these ten."""
+        root = Path(qta.__file__).parent
+        examples = sorted((root / "examples").glob("*.xml"))
+        self.assertTrue(examples)
+        for example in examples:
+            tags = {child.tag.rsplit("}", 1)[-1] for child in
+                    qta.ElementTree.parse(example).getroot()}
+            self.assertFalse(tags & set(self.REMOVED_IN_3), example.name)
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                inputs(vm_count="1", vcpus="4", vmem="4096"):
+            written = set(qta.overlay_elements())
+        self.assertEqual(written, {"vm-count", "vm-vcpus", "vm-vmem",
+                                   "vm-shm-size"})
+        for other in ("action.yml", ".github/workflows/ci.yml"):
+            text = (root / other).read_text()
+            for element in self.REMOVED_IN_3:
+                self.assertNotIn(element, text, (element, other))
+
+    def test_the_readme_names_the_ten_elements_qemu_tool_3_removed(self):
+        """Each of them, and only in the section that says where they went."""
+        readme = (Path(qta.__file__).parent / "README.md").read_text()
+        guide = readme.split("### From qemu-tool 2.x to 3.x")[1].split(
+            "\n## ")[0]
+        for element in self.REMOVED_IN_3:
+            self.assertIn(f"`<{element}>`", guide, element)
+            self.assertNotIn(element, readme.replace(guide, ""), element)
+
+    def test_the_default_range_is_said_the_same_everywhere(self):
+        root = Path(qta.__file__).parent
+        with mock.patch.dict(os.environ, {}, clear=True):
+            spec = qta.install_source(Path("/nonexistent"))["spec"][0]
+        self.assertEqual(spec, "qemu-tool>=2.1,<4")
+        for name in ("README.md", "action.yml"):
+            text = (root / name).read_text()
+            self.assertIn(">=2.1,<4", text, name)
+            self.assertNotIn(">=2.1,<3", text, name)
+        self.assertIn("`>=2.1,<4`", (root / "CHANGELOG.md").read_text())
+
     def test_sizes_in_the_callers_files(self):
         sized = self.xml("sized.xml", "<vm-vcpus>8</vm-vcpus>")
         plain = self.xml("plain.xml", "<vm-count>2</vm-count>")
@@ -425,6 +471,444 @@ class Guests(unittest.TestCase):
                           "      ansible_port: 2224\n", inventory.read_text())
 
 
+def silently(function, *args, **kwargs):
+    """Call, and return what it returned and what it printed."""
+    import contextlib
+    import io
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        result = function(*args, **kwargs)
+    return result, out.getvalue()
+
+
+def guests(*statuses):
+    return [dict(VMS[i], gpu=None, name=f"g-{i + 1}")
+            for i in range(len(statuses))]
+
+
+class GpuModes(unittest.TestCase):
+    """The gpu input: what each value does with each amdgpu-probe status."""
+
+    def probe(self, vms, *rounds):
+        """gpu_status answering each round of statuses in guest order."""
+        answers = iter([word for statuses in rounds for word in statuses])
+        return mock.patch.object(qta, "gpu_status",
+                                 side_effect=lambda vm: next(answers))
+
+    def bring_up(self, fail=()):
+        def one(vm, _tar, _fwset):
+            if vm["name"] in fail:
+                raise qta.Failure(f"{vm['name']}: amdgpu did not bind the "
+                                  "emulated GPU")
+        stack = mock.patch.multiple(
+            qta,
+            read_inventory=mock.Mock(return_value=(
+                {"fleet_guest_rocjitsu_image": "img"}, [])),
+            firmware_set=mock.Mock(return_value="gap"),
+            generate_firmware=mock.Mock(),
+            bring_up_gpu=mock.Mock(side_effect=one))
+        return stack
+
+    def test_the_input(self):
+        for given, want in (("", "true"), ("true", "true"), ("yes", "true"),
+                            ("false", "false"), ("0", "false"),
+                            ("required", "required"), ("Optional", "optional")):
+            with mock.patch.dict(os.environ, {}, clear=True), inputs(gpu=given):
+                self.assertEqual(qta.gpu_mode(), want, given)
+        with inputs(gpu="strict"), self.assertRaises(qta.Failure) as ctx:
+            qta.gpu_mode()
+        self.assertIn("required or optional", str(ctx.exception))
+
+    def test_true_leaves_a_guest_without_a_gpu_alone(self):
+        """As before the modes existed: absent and unknown are no failure."""
+        vms = guests("absent", "unknown", "loaded")
+        with self.probe(vms, ("absent", "unknown", "loaded")):
+            silently(qta.setup_gpus, {}, vms)
+        self.assertEqual([vm["gpu"] for vm in vms],
+                         ["absent", "unknown", "loaded"])
+
+    def test_required_fails_on_absent_and_names_guest_and_status(self):
+        vms = guests("loaded", "absent", "unknown")
+        with self.probe(vms, ("loaded", "absent", "unknown")), \
+                self.assertRaises(qta.Failure) as ctx:
+            silently(qta.setup_gpus, {}, vms, "required")
+        message = str(ctx.exception)
+        self.assertIn("g-2 is absent", message)
+        self.assertIn("g-3 is unknown", message)
+        self.assertNotIn("g-1", message)
+        # The states are recorded although the step fails.
+        self.assertEqual([vm["gpu"] for vm in vms],
+                         ["loaded", "absent", "unknown"])
+
+    def test_required_passes_when_every_gpu_is_bound(self):
+        vms = guests("nofirmware", "loaded")
+        with self.probe(vms, ("nofirmware", "loaded"), ("loaded",)), \
+                self.bring_up():
+            silently(qta.setup_gpus, {"state_file": "/x/state.json"}, vms,
+                     "required")
+            qta.bring_up_gpu.assert_called_once()
+        self.assertEqual([vm["gpu"] for vm in vms], ["loaded", "loaded"])
+
+    def test_required_fails_when_the_bring_up_left_a_gpu_unbound(self):
+        vms = guests("ready")
+        with self.probe(vms, ("ready",), ("unbound",)), self.bring_up(), \
+                self.assertRaises(qta.Failure) as ctx:
+            silently(qta.setup_gpus, {"state_file": "/x/state.json"}, vms,
+                     "required")
+        self.assertIn("g-1 is unbound", str(ctx.exception))
+
+    def test_a_failed_bring_up_fails_true_and_records_every_guest(self):
+        vms = guests("ready", "ready")
+        with self.probe(vms, ("ready", "ready"), ("unbound", "loaded")), \
+                self.bring_up(fail=("g-1",)), \
+                self.assertRaises(qta.Failure) as ctx:
+            silently(qta.setup_gpus, {"state_file": "/x/state.json"}, vms)
+        self.assertIn("g-1: amdgpu did not bind", str(ctx.exception))
+        self.assertEqual([vm["gpu"] for vm in vms], ["unbound", "loaded"])
+
+    def test_stranded_fails_true_and_required_with_the_old_message(self):
+        for mode in ("true", "required"):
+            vms = guests("stranded", "absent")
+            with self.probe(vms, ("stranded", "absent")), \
+                    self.assertRaises(qta.Failure) as ctx:
+                silently(qta.setup_gpus, {}, vms, mode)
+            self.assertIn("g-1: amdgpu is loaded with parameters",
+                          str(ctx.exception))
+            self.assertEqual(vms[1]["gpu"], "absent")
+
+    def test_required_names_every_short_guest_and_brings_up_the_rest(self):
+        vms = guests("stranded", "absent", "ready")
+        with self.probe(vms, ("stranded", "absent", "ready"), ("loaded",)), \
+                self.bring_up(), self.assertRaises(qta.Failure) as ctx:
+            silently(qta.setup_gpus, {"state_file": "/x/s.json"}, vms,
+                     "required")
+            qta.bring_up_gpu.assert_called_once()
+        message = str(ctx.exception)
+        self.assertIn("g-1 is stranded", message)
+        self.assertIn("g-2 is absent", message)
+        self.assertNotIn("g-3", message)
+        self.assertIn("g-1: amdgpu is loaded with parameters", message)
+        self.assertEqual([vm["gpu"] for vm in vms],
+                         ["stranded", "absent", "loaded"])
+        # A bring-up that fails on one guest does not hide another's status.
+        vms = guests("ready", "ready", "absent")
+        with self.probe(vms, ("ready", "ready", "absent"),
+                        ("unbound", "loaded")), \
+                self.bring_up(fail=("g-1",)), \
+                self.assertRaises(qta.Failure) as ctx:
+            silently(qta.setup_gpus, {"state_file": "/x/s.json"}, vms,
+                     "required")
+        message = str(ctx.exception)
+        self.assertIn("g-1 is unbound", message)
+        self.assertIn("g-3 is absent", message)
+        self.assertIn("g-1: amdgpu did not bind", message)
+        self.assertNotIn("g-2", message)
+
+    def test_optional_survives_what_is_not_a_failure_of_its_own(self):
+        """docker missing is FileNotFoundError from subprocess, not Failure."""
+        for boom in (FileNotFoundError("docker"), RuntimeError("x")):
+            vms = guests("ready")
+            with self.probe(vms, ("ready",)), self.bring_up(), \
+                    mock.patch.object(qta, "firmware_set", side_effect=boom):
+                _, out = silently(qta.setup_gpus, {"state_file": "/x/s.json"},
+                                  vms, "optional")
+                qta.bring_up_gpu.assert_not_called()
+            self.assertIn("::warning::gpu: optional", out)
+            self.assertEqual(vms[0]["gpu"], "ready")
+            for mode in ("true", "required"):
+                vms = guests("ready")
+                with self.probe(vms, ("ready",)), self.bring_up(), \
+                        mock.patch.object(qta, "firmware_set",
+                                          side_effect=boom), \
+                        self.assertRaises(type(boom)):
+                    silently(qta.setup_gpus, {"state_file": "/x/s.json"},
+                             vms, mode)
+
+    def test_the_firmware_steps_have_limits(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+                qta.subprocess, "run", side_effect=subprocess.TimeoutExpired(
+                    "docker", 1)) as ran:
+            with self.assertRaises(qta.Failure) as ctx:
+                silently(qta.generate_firmware, "img", "gfx1250", "gap",
+                         Path(tmp, "fw.tar"))
+            self.assertIn("did not finish within", str(ctx.exception))
+            self.assertEqual(ran.call_args_list[0].kwargs["timeout"],
+                             qta.GPU_FIRMWARE_SECONDS)
+            # The limit stops the docker client; the container is removed
+            # by the name it was started under.
+            started, removed = (c.args[0] for c in ran.call_args_list)
+            name = started[started.index("--name") + 1]
+            self.assertTrue(name.startswith("qta-firmware-"))
+            self.assertLess(started.index("--name"), started.index("img"))
+            self.assertEqual(removed, ["docker", "rm", "-f", name])
+            ran.reset_mock()
+            Path(tmp, "fw.tar").write_bytes(b"x")
+            with self.assertRaises(qta.Failure) as ctx:
+                silently(qta.bring_up_gpu, VMS[0], Path(tmp, "fw.tar"), "gap")
+            self.assertIn("g-1: copying the GPU firmware in did not finish",
+                          str(ctx.exception))
+            self.assertEqual(ran.call_args.kwargs["timeout"],
+                             qta.GPU_COPY_SECONDS)
+
+    def test_optional_never_fails_and_says_what_it_saw(self):
+        vms = guests("stranded", "ready", "absent")
+        with self.probe(vms, ("stranded", "ready", "absent"), ("unbound",)), \
+                self.bring_up(fail=("g-2",)):
+            _, out = silently(qta.setup_gpus, {"state_file": "/x/s.json"},
+                              vms, "optional")
+        self.assertEqual([vm["gpu"] for vm in vms],
+                         ["stranded", "unbound", "absent"])
+        self.assertEqual(out.count("::warning::gpu: optional"), 2)
+
+    def test_optional_without_a_rocjitsu_image_is_a_warning(self):
+        vms = guests("ready")
+        with self.probe(vms, ("ready",)), mock.patch.object(
+                qta, "read_inventory", return_value=({}, [])):
+            _, out = silently(qta.setup_gpus, {}, vms, "optional")
+        self.assertIn("::warning::", out)
+        with self.probe(vms, ("ready",)), mock.patch.object(
+                qta, "read_inventory", return_value=({}, [])), \
+                self.assertRaises(qta.Failure):
+            silently(qta.setup_gpus, {}, vms)
+
+    def test_required_needs_reachable_guests(self):
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                inputs(gpu="required", wait_for="none"), \
+                self.assertRaises(qta.Failure) as ctx:
+            qta.validate_guest_inputs()
+        self.assertIn("gpu: required", str(ctx.exception))
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                inputs(gpu="optional", wait_for="none"):
+            self.assertEqual(qta.validate_guest_inputs(), "none")
+
+    def test_a_gpu_failure_is_raised_after_the_outputs_say_what_was_found(self):
+        vms = guests("loaded", "absent")
+        with tempfile.TemporaryDirectory() as tmp:
+            out, summary = Path(tmp, "out"), Path(tmp, "summary")
+            state = {"state_file": str(Path(tmp, "action/ci/state.json")),
+                     "stack_name": "ci", "version": "2.1.0",
+                     "gpu_mode": "required"}
+            Path(state["state_file"]).parent.mkdir(parents=True)
+            env = {"GITHUB_OUTPUT": str(out),
+                   "GITHUB_STEP_SUMMARY": str(summary)}
+            with mock.patch.dict(os.environ, env, clear=True), \
+                    self.probe(vms, ("loaded", "absent")), \
+                    mock.patch.object(qta, "wait_for_ssh"), \
+                    self.assertRaises(qta.Failure) as ctx:
+                silently(qta.wait_and_publish, state, vms, "ssh", "required",
+                         0.0)
+            self.assertIn("g-2 is absent", str(ctx.exception))
+            written = json.loads(Path(state["state_file"]).read_text())
+            self.assertEqual([vm["gpu"] for vm in written["manifest"]],
+                             ["loaded", "absent"])
+            self.assertIn('"gpu": "absent"', out.read_text())
+            self.assertIn("**The GPU step failed**", summary.read_text())
+            # true, with the same guests: no failure, the same record.
+            vms = guests("loaded", "absent")
+            with mock.patch.dict(os.environ, env, clear=True), \
+                    self.probe(vms, ("loaded", "absent")), \
+                    mock.patch.object(qta, "wait_for_ssh"):
+                silently(qta.wait_and_publish, state, vms, "ssh", "true", 0.0)
+            # false: the guests are not asked at all.
+            vms = guests("loaded")
+            with mock.patch.dict(os.environ, env, clear=True), \
+                    mock.patch.object(qta, "gpu_status") as asked, \
+                    mock.patch.object(qta, "wait_for_ssh"):
+                silently(qta.wait_and_publish, state, vms, "ssh", "false", 0.0)
+            asked.assert_not_called()
+            self.assertIsNone(vms[0]["gpu"])
+
+    def test_the_summary_carries_every_status_and_the_failure(self):
+        vms = guests("loaded", "absent")
+        vms[0]["gpu"], vms[1]["gpu"] = "loaded", "absent"
+        with tempfile.TemporaryDirectory() as tmp:
+            summary = Path(tmp, "summary")
+            with mock.patch.dict(os.environ,
+                                 {"GITHUB_STEP_SUMMARY": str(summary)}):
+                qta.summarise({"stack_name": "ci", "version": "2.1.0",
+                               "gpu_mode": "required"}, vms, 3.0,
+                              qta.gpu_shortfall(vms))
+            text = summary.read_text()
+        self.assertIn("| loaded |", text)
+        self.assertIn("| absent |", text)
+        self.assertIn("**The GPU step failed** (`gpu: required`)", text)
+        self.assertIn("g-2 is absent", text)
+
+
+class Aliases(unittest.TestCase):
+    def names(self, text, count=2):
+        vms = [dict(vm) for vm in VMS[:count]]
+        silently(qta.assign_aliases, vms, text)
+        return [vm["ssh_aliases"] for vm in vms]
+
+    def test_the_default_is_what_2_1_wrote(self):
+        self.assertEqual(self.names(""), [["vm1"], ["vm2"]])
+        vms = [dict(vm) for vm in VMS[:2]]
+        qta.assign_aliases(vms, "")
+        with tempfile.TemporaryDirectory() as tmp:
+            qta.write_ssh_config(vms, Path(tmp, "c"))
+            self.assertIn("Host g-2 vm2\n", Path(tmp, "c").read_text())
+
+    def test_one_name_for_the_first_guest_and_a_pattern_for_all(self):
+        self.assertEqual(self.names("guest guest{index}"),
+                         [["guest", "guest1", "vm1"], ["guest2", "vm2"]])
+        vms = [dict(vm) for vm in VMS[:2]]
+        qta.assign_aliases(vms, "guest guest{index}")
+        with tempfile.TemporaryDirectory() as tmp:
+            qta.write_ssh_config(vms, Path(tmp, "c"))
+            text = Path(tmp, "c").read_text()
+        self.assertIn("Host g-1 guest guest1 vm1\n", text)
+        self.assertIn("Host g-2 guest2 vm2\n", text)
+
+    def test_a_list_names_the_guests_in_order(self):
+        self.assertEqual(self.names("server, head\n# comment\nclient"),
+                         [["server", "head", "vm1"], ["client", "vm2"]])
+        self.assertEqual(self.names("only"), [["only", "vm1"], ["vm2"]])
+
+    def test_vm_n_gives_way_to_the_callers_use_of_the_word(self):
+        self.assertEqual(self.names("vm2\nvm1"), [["vm2"], ["vm1"]])
+        # The guest's own name is a Host name already and is not repeated.
+        self.assertEqual(self.names("g-1"), [["vm1"], ["vm2"]])
+
+    def test_words_ssh_would_read_as_patterns_are_refused(self):
+        for bad in ("gu*st", "guest?", "!guest", "a/b", "-x", "{index",
+                    "guest{name}", "guest{index}{", "a:b", "caf\u00e9"):
+            with self.assertRaises(qta.Failure, msg=bad):
+                qta.check_aliases(bad)
+        qta.check_aliases("guest guest{index} a.b_c-d 1st")
+
+    def test_an_alias_names_one_guest(self):
+        with self.assertRaises(qta.Failure):
+            qta.check_aliases("guest guest")
+        with self.assertRaises(qta.Failure):
+            qta.check_aliases("guest\nguest")
+        # Seen only with the fleet's size: a pattern meeting a name.
+        qta.check_aliases("guest{index}\nfirst\nguest1")
+        with self.assertRaises(qta.Failure) as ctx:
+            qta.check_aliases("guest{index}\nfirst\nguest1", 2)
+        self.assertIn("'guest1' would name both", str(ctx.exception))
+        # Another guest's own name.
+        with self.assertRaises(qta.Failure):
+            self.names("g-2")
+
+    def test_only_a_line_with_a_name_of_its_own_is_a_guests_line(self):
+        """A line of {index} words alone, like a comment, is no guest's."""
+        self.assertEqual(self.names("guest{index}\nguest"),
+                         [["guest", "guest1", "vm1"], ["guest2", "vm2"]])
+        self.assertEqual(self.names("# c\n\nn{index}\nfoo\nbar"),
+                         [["foo", "n1", "vm1"], ["bar", "n2", "vm2"]])
+        # So such a line is not a guest the fleet lacks, either.
+        qta.check_aliases("a\nb\nguest{index}", 2)
+
+    def test_another_guests_name_is_refused_before_boot(self):
+        """With the fleet's prefix the guests' names are known: <prefix>-<n>."""
+        qta.check_aliases("ci-2", 2)   # no prefix, so not seen yet
+        with self.assertRaises(qta.Failure) as ctx:
+            qta.check_aliases("ci-2", 2, "ci")
+        self.assertIn("'ci-2' would name both ci-2 and ci-1",
+                      str(ctx.exception))
+        qta.check_aliases("ci-1\nci-2", 2, "ci")   # each its own name
+        qta.check_aliases("ci-2", 1, "ci")           # no such guest
+        self.assertEqual(qta.guest_names("ci", 2), ["ci-1", "ci-2"])
+
+    def test_a_name_for_a_guest_the_fleet_lacks_is_refused_before_boot(self):
+        qta.check_aliases("a\nb", 2)
+        with self.assertRaises(qta.Failure) as ctx:
+            qta.check_aliases("a\nb\nc", 2)
+        self.assertIn("names guest 3 (c) and the fleet has 2",
+                      str(ctx.exception))
+        qta.check_aliases("a\nb\nc")   # the size is not known yet
+
+    def test_bad_aliases_and_timeouts_are_refused_before_boot(self):
+        for bad in ({"ssh_aliases": "gu*st"}, {"stack_timeout": "10m"},
+                    {"diagnostics": "maybe"}, {"gpu": "strict"}):
+            with mock.patch.dict(os.environ, {}, clear=True), inputs(**bad), \
+                    self.assertRaises(qta.Failure, msg=str(bad)):
+                qta.validate_guest_inputs()
+
+
+class Bounded(unittest.TestCase):
+    def test_a_command_that_finishes(self):
+        silently(qta.run_within, ["true"], 10, "true")
+        with self.assertRaises(qta.Failure) as ctx:
+            silently(qta.run_within, ["sh", "-c", "exit 4"], 10, "it")
+        self.assertIn("exited 4", str(ctx.exception))
+        with self.assertRaises(qta.Failure):
+            silently(qta.run_within, ["/nonexistent/program"], 10, "it")
+
+    def test_a_command_that_does_not_is_stopped_with_its_children(self):
+        import time
+        with tempfile.TemporaryDirectory() as tmp:
+            pidfile = Path(tmp, "pid")
+            script = f"sleep 300 & echo $! > {pidfile}; wait"
+            began = time.monotonic()
+            with self.assertRaises(qta.Failure) as ctx:
+                silently(qta.run_within, ["sh", "-c", script], 1,
+                         "the stack")
+            self.assertLess(time.monotonic() - began, 20)
+            self.assertIn("the stack did not finish within 1 s",
+                          str(ctx.exception))
+            child = int(pidfile.read_text())
+            for _ in range(50):
+                try:
+                    os.kill(child, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.1)
+            else:
+                self.fail("the command's child outlived it")
+
+
+    def test_what_ignores_sigterm_is_killed_after_its_leader_exits(self):
+        import time
+        with tempfile.TemporaryDirectory() as tmp:
+            pidfile = Path(tmp, "pid")
+            script = (f"(trap '' TERM; echo $BASHPID > {pidfile}; "
+                      "sleep 300) & wait")
+            with self.assertRaises(qta.Failure):
+                silently(qta.run_within, ["bash", "-c", script], 1, "it")
+            self.assertGone(int(pidfile.read_text()))
+
+    def test_an_interrupted_step_stops_the_command(self):
+        import signal
+        import threading
+        import time
+        with tempfile.TemporaryDirectory() as tmp:
+            pidfile = Path(tmp, "pid")
+            script = f"echo $$ > {pidfile}; exec sleep 300"
+            timer = threading.Timer(
+                1, lambda: os.kill(os.getpid(), signal.SIGINT))
+            timer.start()
+            try:
+                with self.assertRaises(KeyboardInterrupt):
+                    silently(qta.run_within, ["sh", "-c", script], 60, "it")
+            finally:
+                timer.cancel()
+            self.assertGone(int(pidfile.read_text()))
+
+    def assertGone(self, pid):
+        import time
+        for _ in range(50):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.1)
+        os.kill(pid, 9)   # not left behind by a failing test
+        self.fail("a process the command started outlived it")
+
+    def test_a_whole_number_is_ascii_digits(self):
+        for bad in ("abc", "-1", "1.5", "1e3", "\u00b2", "\uff15"):
+            with inputs(**{"stack-timeout": bad}), \
+                    self.assertRaises(qta.Failure) as ctx:
+                qta.whole_number("stack-timeout", "0")
+            self.assertIn("must be a whole number", str(ctx.exception))
+        for good, value in (("0", 0), ("", 0), (" 7 ", 7)):
+            with inputs(**{"stack-timeout": good}):
+                self.assertEqual(qta.whole_number("stack-timeout", "0"), value)
+
+
 class Plumbing(unittest.TestCase):
     def test_multiline_output_round_trips(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -482,13 +966,14 @@ FAKE_SSH = """#!/usr/bin/env bash
 port=; while [ $# -gt 1 ]; do
   case "$1" in -p) port=$2; shift 2;; -o|-i) shift 2;; *) shift;; esac
 done
+case " $QT_FAKE_DOWN " in *" $port "*) exit 255;; esac
 home="$QT_FAKE_GUESTS/$port"; mkdir -p "$home"; cd "$home"
 HOME="$home" exec bash -c "$1"
 """
 
 
-class WithFakeGuests(unittest.TestCase):
-    """copy, run and fetch against a stub ssh, one directory per guest."""
+class FakeGuests(unittest.TestCase):
+    """A stub ssh on PATH, one directory per guest."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -514,6 +999,10 @@ class WithFakeGuests(unittest.TestCase):
 
     def home(self, vm):
         return self.guests / str(vm["ssh_port"])
+
+
+class WithFakeGuests(FakeGuests):
+    """copy, run and fetch against the stub ssh."""
 
     def test_copy_lands_in_every_guest(self):
         self.assertEqual(qta.copy_all(VMS, [f"{self.src}:~/proj"]), "~/proj")
@@ -560,6 +1049,754 @@ class WithFakeGuests(unittest.TestCase):
         for vm in VMS:
             got = Path(self.state["fetch_dir"]) / vm["name"] / "out" / "report"
             self.assertEqual(got.read_text(), "r\n")
+
+
+FAKE_TOOL = """#!/usr/bin/env bash
+printf '%s\\n' "$@" > "$QT_FAKE_TOOL_ARGS"
+echo "QEMU_TOOL_SRC=$QEMU_TOOL_SRC" >> "$QT_FAKE_TOOL_ARGS"
+cat <<'YAML'
+name: ci
+services:
+  grafana:
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+  qemu-1:
+    command: run-vm --vm-name ci-1 --password hunter2 --vcpus 4
+YAML
+"""
+
+
+class Diagnostics(FakeGuests):
+    """The diagnostics input, against the stub ssh."""
+
+    def setUp(self):
+        super().setUp()
+        root = Path(self.tmp.name)
+        self.logs = root / "logs"
+        self.stack = root / "stack"
+        self.stack.mkdir()
+        (self.stack / "docker-compose.yml").write_text("services: {}\n")
+        tool = root / "bin" / "qemu-tool"
+        tool.write_text(FAKE_TOOL)
+        tool.chmod(0o755)
+        self.tool_args = root / "tool-args"
+        self.summary = root / "summary"
+        patch = mock.patch.dict(os.environ, {
+            "QT_FAKE_TOOL_ARGS": str(self.tool_args),
+            "GITHUB_STEP_SUMMARY": str(self.summary)})
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.state.update(stack_name="ci", stack_dir=str(self.stack),
+                          logs_dir=str(self.logs), tool=str(tool),
+                          images_dir=str(root / "images"), metrics=True,
+                          manifest=[dict(vm) for vm in VMS[:2]])
+        commands = mock.patch.object(qta, "GUEST_DIAGNOSTICS", (
+            ("ok.txt", "echo collected on port $PWD"),
+            ("fails.txt", "echo before; exit 3"),
+            ("big.txt", "head -c 5000 /dev/zero | tr '\\0' x")))
+        commands.start()
+        self.addCleanup(commands.stop)
+
+    def test_each_guest_gets_a_directory_and_a_failure_is_noted(self):
+        missing, _ = silently(qta.collect_diagnostics, self.state)
+        root = self.logs / "diagnostics"
+        for vm in VMS[:2]:
+            self.assertIn("collected on port",
+                          (root / vm["name"] / "ok.txt").read_text())
+            # What a failing command did print is kept.
+            self.assertEqual((root / vm["name"] / "fails.txt").read_text(),
+                             "before\n")
+        self.assertEqual(sorted(missing), ["g-1: fails.txt exited 3",
+                                           "g-2: fails.txt exited 3"])
+        notes = (root / "NOTES.txt").read_text()
+        self.assertIn("  g-1/ok.txt\n", notes)
+        self.assertIn("  compose-config.yml\n", notes)
+        self.assertIn("  g-2: fails.txt exited 3\n", notes)
+        self.assertIn("- g-1: fails.txt exited 3", self.summary.read_text())
+
+    def test_a_guest_that_does_not_answer_does_not_hide_the_others(self):
+        with mock.patch.dict(os.environ, {"QT_FAKE_DOWN": "2222"}):
+            missing, out = silently(qta.collect_diagnostics, self.state)
+        root = self.logs / "diagnostics"
+        self.assertIn("g-1: did not answer SSH, nothing collected", missing)
+        self.assertFalse((root / "g-1" / "ok.txt").exists())
+        self.assertTrue((root / "g-2" / "ok.txt").is_file())
+        self.assertTrue((root / "compose-config.yml").is_file())
+        self.assertIn("::warning::diagnostics: g-1: did not answer", out)
+
+    def test_a_command_that_hangs_is_given_up_on(self):
+        with mock.patch.object(qta, "GUEST_DIAGNOSTICS",
+                               (("hang.txt", "sleep 30"),
+                                ("after.txt", "echo still here"))), \
+                mock.patch.object(qta, "DIAG_SECONDS", 1):
+            missing = qta.guest_diagnostics(VMS[0], self.logs / "g")
+        self.assertEqual(missing, ["g-1: hang.txt timed out, nothing written"])
+        self.assertEqual((self.logs / "g" / "after.txt").read_text(),
+                         "still here\n")
+
+    def test_a_command_that_times_out_keeps_what_it_printed(self):
+        with mock.patch.object(qta, "GUEST_DIAGNOSTICS",
+                               (("slow.txt", "echo partial; sleep 30"),)), \
+                mock.patch.object(qta, "DIAG_SECONDS", 1):
+            missing = qta.guest_diagnostics(VMS[0], self.logs / "g")
+        self.assertEqual(missing, [
+            "g-1: slow.txt timed out, what it had printed was kept"])
+        self.assertEqual((self.logs / "g" / "slow.txt").read_text(),
+                         "partial\n")
+
+    def test_a_guest_that_stalls_costs_a_bounded_time(self):
+        with mock.patch.object(qta, "GUEST_DIAGNOSTICS", tuple(
+                (f"{n}.txt", "sleep 30") for n in "abcd")), \
+                mock.patch.object(qta, "DIAG_SECONDS", 1), \
+                mock.patch.object(qta, "DIAG_GUEST_SECONDS", 1):
+            missing = qta.guest_diagnostics(VMS[0], self.logs / "g")
+        self.assertEqual(len(missing), 4)
+        self.assertGreaterEqual(sum("timed out" in m for m in missing), 1)
+        self.assertGreaterEqual(sum("skipped" in m for m in missing), 2)
+
+    def test_a_second_collection_reports_only_what_it_wrote(self):
+        """up, down, up in one job, or a work-dir that outlives it."""
+        silently(qta.collect_diagnostics, self.state)
+        root = self.logs / "diagnostics"
+        self.assertTrue((root / "g-1" / "ok.txt").is_file())
+        self.summary.write_text("")
+        # The same fleet again, its first guest now dead.
+        with mock.patch.dict(os.environ, {"QT_FAKE_DOWN": "2222"}):
+            missing, out = silently(qta.collect_diagnostics, self.state)
+        self.assertIn("g-1: did not answer SSH, nothing collected", missing)
+        self.assertFalse((root / "g-1").exists())
+        notes = (root / "NOTES.txt").read_text()
+        self.assertNotIn("g-1/ok.txt", notes)
+        self.assertEqual(notes.split("\n\n")[0].splitlines(), [
+            "Collected:", "  g-2/big.txt", "  g-2/fails.txt", "  g-2/ok.txt",
+            "  compose-config.yml"])
+        self.assertNotIn("earlier collection", notes)
+        self.assertIn("4 file(s)", out)
+        self.assertIn("4 file(s)", self.summary.read_text())
+
+    def test_another_fleets_files_are_named_as_not_this_ones(self):
+        silently(qta.collect_diagnostics, self.state)
+        root = self.logs / "diagnostics"
+        # A fleet of one guest, and no way to render its stack.
+        self.state["manifest"] = [dict(VMS[1])]
+        self.state["tool"] = "/nonexistent/qemu-tool"
+        missing, out = silently(qta.collect_diagnostics, self.state)
+        self.assertEqual(sorted(missing), [
+            "compose-config.yml: no qemu-tool to render it with",
+            "g-2: fails.txt exited 3"])
+        # The earlier fleet's rendering is not left to pass for this one's.
+        self.assertFalse((root / "compose-config.yml").exists())
+        collected, _, earlier = (root / "NOTES.txt").read_text().split("\n\n")
+        self.assertEqual(collected.splitlines(), [
+            "Collected:", "  g-2/big.txt", "  g-2/fails.txt", "  g-2/ok.txt"])
+        self.assertEqual(earlier.splitlines(), [
+            "Left by an earlier collection, not part of this one:",
+            "  g-1/big.txt", "  g-1/fails.txt", "  g-1/ok.txt"])
+        self.assertIn("3 file(s)", out)
+
+    def test_a_guests_directory_is_emptied_before_it_is_collected_into(self):
+        target = self.logs / "g"
+        target.mkdir(parents=True)
+        (target / "stale.txt").write_text("the previous fleet's")
+        qta.guest_diagnostics(VMS[0], target)
+        self.assertEqual(sorted(p.name for p in target.iterdir()),
+                         ["big.txt", "fails.txt", "ok.txt"])
+        # A file, or a link, where the directory goes is replaced too.
+        elsewhere = self.logs / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "kept.txt").write_text("not ours")
+        for make in (lambda: target.write_text("x"),
+                     lambda: target.symlink_to(elsewhere)):
+            qta._cleared(target)
+            make()
+            qta.guest_diagnostics(VMS[0], target)
+            self.assertTrue(target.is_dir() and not target.is_symlink())
+        self.assertEqual((elsewhere / "kept.txt").read_text(), "not ours")
+
+    def test_a_rendering_that_blows_up_does_not_cost_the_guests_files(self):
+        for error in (ValueError("bad yaml"), OSError("no disk")):
+            with mock.patch.object(qta, "compose_config", side_effect=error):
+                missing, _ = silently(qta.collect_diagnostics, self.state)
+            self.assertIn(f"compose-config.yml: {type(error).__name__}: "
+                          f"{error}", missing)
+            notes = (self.logs / "diagnostics" / "NOTES.txt").read_text()
+            self.assertIn("  g-1/ok.txt\n", notes)
+            self.assertNotIn("  compose-config.yml\n", notes)
+
+    def test_the_bound_is_in_bytes_whatever_the_guest_printed(self):
+        """Output that is not UTF-8 is read as three bytes a bad byte."""
+        cases = (
+            ("head -c 5000 /dev/zero | tr '\\0' '\\377'; echo END", "END\n"),
+            ("for i in $(seq 400); do printf '\\303\\251'; done; echo END",
+             "\u00e9END\n"))
+        for command, end in cases:
+            with mock.patch.object(qta, "DIAG_BYTES", 100), mock.patch.object(
+                    qta, "GUEST_DIAGNOSTICS", (("odd.txt", command),)):
+                qta.guest_diagnostics(VMS[0], self.logs / "g")
+            data = (self.logs / "g" / "odd.txt").read_bytes()
+            self.assertLessEqual(len(data), 100)
+            self.assertGreaterEqual(len(data), 97)
+            # Cut on a character: it reads back as it is.
+            self.assertTrue(data.decode("utf-8").endswith(end), data[-8:])
+        self.assertEqual(qta._last_bytes("ab\u00e9", 1), b"")
+        self.assertEqual(qta._last_bytes("ab\u00e9", 2), "\u00e9".encode())
+        self.assertEqual(qta._last_bytes("abc", 0), b"")
+        self.assertEqual(qta._first_bytes("\u00e9\u00e9\u00e9", 3),
+                         "\u00e9".encode())
+        self.assertEqual(qta._first_bytes("abc", 9), b"abc")
+
+    def test_the_compose_config_is_bounded_in_bytes_and_keeps_its_start(self):
+        target = self.logs / "compose-config.yml"
+        self.logs.mkdir()
+        with mock.patch.object(qta, "DIAG_BYTES", 30), mock.patch.object(
+                qta, "redact", return_value="name: ci\n" + "\u20ac" * 50):
+            self.assertIsNone(qta.compose_config(self.state, target))
+        data = target.read_bytes()
+        self.assertEqual(len(data), 30)
+        self.assertEqual(data.decode("utf-8"), "name: ci\n" + "\u20ac" * 7)
+
+    def test_a_guest_that_does_not_answer_gets_no_directory(self):
+        with mock.patch.dict(os.environ, {"QT_FAKE_DOWN": "2222"}):
+            qta.guest_diagnostics(VMS[0], self.logs / "g")
+        self.assertFalse((self.logs / "g").exists())
+
+    def test_each_side_bounds_a_file_on_its_own(self):
+        """The guest's tail and the runner's slice, one without the other."""
+        import subprocess
+        seen = []
+
+        def fake(cmd, seconds, **_kwargs):
+            seen.append(cmd[-1])
+            return subprocess.CompletedProcess(cmd, 0, "x" * 500 + "END", "")
+        with mock.patch.object(qta, "DIAG_BYTES", 100), \
+                mock.patch.object(qta, "bounded", side_effect=fake):
+            qta.guest_diagnostics(VMS[0], self.logs / "g")
+        for remote in seen[1:]:
+            self.assertIn("| tail -c 100", remote)
+            self.assertIn(f"timeout -k 5 {qta.DIAG_SECONDS} ", remote)
+        self.assertEqual(len(seen), 1 + len(qta.GUEST_DIAGNOSTICS))
+        text = (self.logs / "g" / "ok.txt").read_text()
+        self.assertEqual(len(text), 100)
+        self.assertTrue(text.endswith("END"))
+
+    def test_each_file_is_bounded_and_keeps_its_end(self):
+        with mock.patch.object(qta, "DIAG_BYTES", 100), mock.patch.object(
+                qta, "GUEST_DIAGNOSTICS",
+                (("big.txt", "head -c 5000 /dev/zero | tr '\\0' x; echo END"),)):
+            qta.guest_diagnostics(VMS[0], self.logs / "g")
+        text = (self.logs / "g" / "big.txt").read_text()
+        self.assertEqual(len(text), 100)
+        self.assertTrue(text.endswith("END\n"))
+
+    def test_the_compose_config_is_rendered_the_actions_way_and_redacted(self):
+        target = self.logs / "compose-config.yml"
+        self.logs.mkdir()
+        self.assertIsNone(qta.compose_config(self.state, target))
+        text = target.read_text()
+        self.assertNotIn("admin", text.replace("ADMIN", ""))
+        self.assertNotIn("hunter2", text)
+        self.assertIn("GF_SECURITY_ADMIN_PASSWORD: [redacted]", text)
+        self.assertIn("--password [redacted] --vcpus 4", text)
+        self.assertIn('GF_AUTH_ANONYMOUS_ENABLED: "true"', text)
+        args = self.tool_args.read_text().splitlines()
+        self.assertEqual(args, [
+            "compose", "--stack-dir", str(self.stack), "--images",
+            self.state["images_dir"], "--profile", "metrics", "config",
+            f"QEMU_TOOL_SRC={self.stack}"])
+
+    def test_no_stack_or_no_tool_is_a_note(self):
+        (self.stack / "docker-compose.yml").unlink()
+        self.assertIn("never generated", qta.compose_config(
+            self.state, self.logs / "c.yml"))
+        (self.stack / "docker-compose.yml").write_text("")
+        self.state["tool"] = "/nonexistent/qemu-tool"
+        self.assertIn("no qemu-tool", qta.compose_config(
+            self.state, self.logs / "c.yml"))
+
+    def test_a_fleet_that_never_came_up_still_names_its_guests(self):
+        self.state["guests"] = self.state.pop("manifest")
+        self.state["manifest"] = []
+        silently(qta.collect_diagnostics, self.state)
+        self.assertTrue((self.logs / "diagnostics/g-2/ok.txt").is_file())
+        self.state["guests"] = []
+        missing, _ = silently(qta.collect_diagnostics, self.state)
+        self.assertIn("guests: the fleet never got as far as having any",
+                      missing)
+
+    def test_off_unless_asked_and_the_up_step_is_remembered(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(qta.want_diagnostics({}))
+            self.assertTrue(qta.want_diagnostics({"diagnostics": True}))
+            with inputs(diagnostics="false"):
+                self.assertFalse(qta.want_diagnostics({"diagnostics": True}))
+            with inputs(diagnostics="true"):
+                self.assertTrue(qta.want_diagnostics({}))
+            with inputs(diagnostics="perhaps"):
+                got, out = silently(qta.want_diagnostics, {"diagnostics": True})
+            self.assertFalse(got)
+            self.assertIn("::warning::", out)
+
+    def teardown_calls(self, collect):
+        order = []
+        with mock.patch.object(qta, "project_containers",
+                               side_effect=[["c1"], [], []]), \
+                mock.patch.object(qta, "collect_logs",
+                                  side_effect=lambda *a: order.append("logs")), \
+                mock.patch.object(qta, "collect_diagnostics", side_effect=collect(order)), \
+                mock.patch.object(qta, "labelled", return_value=[]), \
+                mock.patch.object(qta, "run", side_effect=lambda cmd, **k:
+                                  order.append("down" if "down" in cmd else "run")):
+            silently(qta.teardown, self.state)
+        return order
+
+    def test_diagnostics_come_before_the_fleet_is_torn_down(self):
+        def collect(order):
+            return lambda state: order.append("diagnostics")
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(self.teardown_calls(collect), ["logs", "down"])
+            self.state["diagnostics"] = True
+            self.assertEqual(self.teardown_calls(collect),
+                             ["logs", "diagnostics", "down"])
+
+    def test_teardown_goes_on_when_diagnostics_blow_up(self):
+        def collect(order):
+            def boom(state):
+                raise RuntimeError("no disk")
+            return boom
+        self.state["diagnostics"] = True
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(self.teardown_calls(collect), ["logs", "down"])
+
+
+class Redaction(unittest.TestCase):
+    def test_values_that_read_as_credentials_go(self):
+        text = """services:
+  grafana:
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_SECURITY_ADMIN_USER: "admin"
+      - LOKI_TOKEN=abc123
+      "API_KEY": 'k'
+    command:
+      - run-vm
+      - --password
+      - hunter2
+      - --vcpus
+      - "4"
+    entrypoint: sh -c "run --db-password=p4ss --secret 'two words' --port 9"
+    image: https://user:pw@registry.example/x:1
+    volumes:
+      - /var/lib/qemu-tool/keys:/keys:ro
+"""
+        out = qta.redact(text)
+        for secret in (": admin\n", "abc123", "'k'", "hunter2", "p4ss",
+                       "two words", ":pw@"):
+            self.assertNotIn(secret, out, secret)
+        self.assertEqual(out.count("[redacted]"), 7)
+        for kept in ('GF_SECURITY_ADMIN_USER: "admin"', "- --vcpus", '- "4"',
+                     "--port 9", "/var/lib/qemu-tool/keys:/keys:ro",
+                     "https://user:[redacted]@registry.example/x:1"):
+            self.assertIn(kept, out, kept)
+
+    def test_hyphen_spellings_of_api_key_and_private_key(self):
+        text = """    command: run --api-key=S1 --private-key S2 --api_key S3 --apikey S4
+      - --api-key
+      - S5
+      API-KEY: S6
+      PRIVATE-KEY: S7
+"""
+        out = qta.redact(text)
+        for n in range(1, 8):
+            self.assertNotIn(f"S{n}", out)
+        self.assertEqual(out.count("[redacted]"), 7)
+
+    def test_names_that_end_like_credentials_and_block_scalars(self):
+        text = """    environment:
+      AWS_ACCESS_KEY_ID: S1
+      S3_KEY: S2
+      SMTP_PASS: S3
+      REGISTRY_AUTH: S4
+      AUTHORIZATION: Bearer S5S5S5S5
+      cookie: S6
+      SSH_KEY: |-
+        -----BEGIN S7-----
+
+        S8
+      MY_PASSWORD: >2-
+        S9
+      DSN: "user=u password=S10"
+      HEADER: "X: Bearer S11S11S11"
+      - s3:bucket=b,secret_key=S12,region=r
+      AFTER: kept
+"""
+        out = qta.redact(text)
+        for n in range(1, 13):
+            self.assertNotIn(f"S{n}", out.replace("S3_KEY", ""), n)
+        # The block's header stays and its lines become one.
+        self.assertIn("      SSH_KEY: |-\n        [redacted]\n"
+                      "      MY_PASSWORD: >2-\n        [redacted]\n"
+                      '      DSN: "user=u password=[redacted]"\n', out)
+        self.assertIn("bucket=b,secret_key=[redacted],region=r", out)
+        self.assertTrue(out.endswith("      AFTER: kept\n"))
+
+    def test_a_url_password_with_no_user_name(self):
+        out = qta.redact("      REDIS_URL: redis://:hunter4@h:6379\n"
+                         "      AMQP: amqp://user:hunter5@h\n"
+                         "      PLAIN: http://h:6379/x@y\n")
+        self.assertEqual(out, "      REDIS_URL: redis://:[redacted]@h:6379\n"
+                              "      AMQP: amqp://user:[redacted]@h\n"
+                              "      PLAIN: http://h:6379/x@y\n")
+
+    def test_a_url_whose_user_part_is_a_token(self):
+        text = ("      REPO: https://ghp_S1S1S1@github.com/o/r.git\n"
+                "      - PIP_INDEX_URL=https://S2@pypi.example/simple\n"
+                "    command: git clone https://x-access-token:S3@h/o/r\n"
+                # No user part: a path, an address, a port, an IPv6 host.
+                "      PLAIN: http://h:6379/x@y\n"
+                "      NOPORT: http://h/x@y\n"
+                "      MAIL: admin@example.com\n"
+                "      V6: http://[::1]:80/a@b\n"
+                "      SCP: git@github.com:o/r.git\n")
+        out = qta.redact(text)
+        for n in (1, 2, 3):
+            self.assertNotIn(f"S{n}", out)
+        self.assertIn("REPO: https://[redacted]@github.com/o/r.git\n", out)
+        self.assertIn("PIP_INDEX_URL=https://[redacted]@pypi.example/", out)
+        self.assertIn("https://x-access-token:[redacted]@h/o/r\n", out)
+        self.assertEqual(out.splitlines()[3:], text.splitlines()[3:])
+
+    def test_a_mapping_or_a_list_under_a_secret_name_goes_whole(self):
+        text = """name: ci
+secrets:
+  db:
+    content: S1
+services:
+  auth:
+    image: kept
+    credentials:   # ours
+      user: S2
+      nested:
+        value: S3
+
+      more: S4
+    environment:
+      API_TOKENS:
+        - S5
+        - S6
+      TOKEN:
+      AFTER: kept
+    registry_auth:
+      - S7
+volumes:
+  key:
+    driver: local
+"""
+        out = qta.redact(text)
+        for n in range(1, 8):
+            self.assertNotIn(f"S{n}", out, n)
+        self.assertEqual(out, """name: ci
+secrets: [redacted]
+services:
+  auth:
+    image: kept
+    credentials: [redacted]
+    environment:
+      API_TOKENS: [redacted]
+      TOKEN:
+      AFTER: kept
+    registry_auth: [redacted]
+volumes:
+  key:
+    driver: local
+""")
+
+    def test_a_list_at_its_keys_own_column_goes_too(self):
+        """YAML allows a key's list to start under the key's first letter."""
+        text = """    password:
+    - S1
+    -
+      - S2
+    after: kept
+    items:
+    - kept
+    - registry_auth:
+      - S3
+      plain: kept
+    - kept
+"""
+        self.assertEqual(qta.redact(text), """    password: [redacted]
+    after: kept
+    items:
+    - kept
+    - registry_auth: [redacted]
+      plain: kept
+    - kept
+""")
+
+    def test_a_service_keeps_its_name_where_another_refers_to_it(self):
+        text = """services:
+  auth:
+    depends_on:
+      token-db:
+        condition: service_healthy
+        password: S1
+      auth:
+        condition: service_started
+    networks:
+      token-net: null
+      secret-net:
+        ipv4_address: 10.0.0.2
+    environment:
+      PLAIN: kept
+      TOKEN: S2
+    labels:
+      networks:
+        password: S3
+        credentials:
+          - S4
+    token: S5
+"""
+        out = qta.redact(text)
+        for n in range(1, 6):
+            self.assertNotIn(f"S{n}", out, n)
+        self.assertEqual(out, """services:
+  auth:
+    depends_on:
+      token-db:
+        condition: service_healthy
+        password: [redacted]
+      auth:
+        condition: service_started
+    networks:
+      token-net: null
+      secret-net:
+        ipv4_address: 10.0.0.2
+    environment:
+      PLAIN: kept
+      TOKEN: [redacted]
+    labels:
+      networks:
+        password: [redacted]
+        credentials: [redacted]
+    token: [redacted]
+""")
+
+    def test_a_flag_value_stops_at_the_separator_that_ends_it(self):
+        for line, want in (
+                ("- echo --token=hunter7; next", "- echo --token=[redacted]; next"),
+                ("- a --token hunter7 && b", "- a --token [redacted] && b"),
+                ("- a --token=hunter7| b", "- a --token=[redacted]| b"),
+                ("- a --token=hunter7;", "- a --token=[redacted];"),
+                # Inside the word it is part of the secret.
+                ("- --token=hun;ter&7|x", "- --token=[redacted]")):
+            self.assertEqual(qta.redact(line), want)
+
+    def test_names_that_only_look_alike_are_kept(self):
+        text = """      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      KEYBOARD: us
+      MONKEY: banana
+      PASSTHROUGH: "yes"
+      - --key-dir=/var/lib/qemu-tool/keys
+      - --ssh-key-file
+      - /k/id_rsa
+      NOTES: |-
+        kept
+"""
+        self.assertEqual(qta.redact(text), text)
+
+    def test_settings_of_a_model_server_are_not_credentials(self):
+        text = """      TOKENIZERS_PARALLELISM: "false"
+      MAX_TOKENS: "4096"
+      - --max-new-tokens
+      - "128"
+      - --max-tokens=512
+      - --num-tokens=3
+      VLLM_ARGS: --max-num-batched-tokens 8192 --tokenizer-mode auto
+"""
+        self.assertEqual(qta.redact(text), text)
+        # A token is still one, plural or not.
+        for line in ("      HF_TOKEN: hf_abcdef\n", "      API_TOKENS: a,b\n",
+                     "    command: app --api-token hunter2\n"):
+            self.assertNotIn(line.split()[-1], qta.redact(line))
+
+    def test_values_as_docker_compose_quotes_them(self):
+        """A string holding `: ` comes out single-quoted, with the quotes
+        inside it doubled. These two lines are `docker compose config`
+        output, not written by hand."""
+        text = ("      - 'curl -H ''Accept: x'' --password ''hunter one'' && true'\n"
+                "      ARGS: '--note ''a: b'' --db-password ''hunter three'''\n")
+        self.assertNotIn("hunter", qta.redact(text))
+
+    def test_flags_and_variables_ending_in_pass_auth_or_key(self):
+        text = ("      - --smtp-pass\n      - hunter2\n"
+                "      - --smtp-pass=hunter3\n"
+                "      - --auth\n      - user:hunter4\n"
+                "    command: app --smtp-pass hunter5 --admin-pass=hunter7\n"
+                "    entrypoint: env DB_PASS=hunter8 AWS_SECRET_ACCESS_KEY=hunter9"
+                " AWS_ACCESS_KEY_ID=hunter10 app\n"
+                "      HDR: 'Authorization: Token hunter11abcdef'\n")
+        self.assertNotIn("hunter", qta.redact(text))
+
+    def test_redaction_is_by_name_and_says_so(self):
+        """What it cannot see, so the docs do not promise more."""
+        text = ("      test: [CMD, curl, -pS1, -u, admin:S2]\n"
+                "    command: mysql -pS3 -uroot && curl -u admin:S4 h\n"
+                "      DSN: S5\n")
+        self.assertEqual(qta.redact(text), text)
+        # Why -pVALUE has no rule: these are not secrets, and read the same.
+        ordinary = ("    command: mkdir -p /x && ssh -p2222 h && gcc -pthread"
+                    " && docker run -p8080:80 -u 1000:1000 i\n")
+        self.assertEqual(qta.redact(ordinary), ordinary)
+        root = Path(qta.__file__).parent
+        for name in ("action.yml", "README.md"):
+            self.assertIn("by name", (root / name).read_text(), name)
+        readme = " ".join((root / "README.md").read_text().split())
+        for said in ("`-pSECRET`", "`-u user:SECRET`", "`https://TOKEN@host/`",
+                     "a mapping or a list under such a key",
+                     "`secrets:` section"):
+            self.assertIn(said, readme, said)
+
+    def test_the_module_script_is_sound_shell(self):
+        import subprocess
+        done = subprocess.run(["bash", "-n", "-c", qta._MODULE_PARAMETERS],
+                              capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        modules = ("amdgpu", "ionic", "ionic_rdma", "ernic_p4", "ib_core",
+                   "ib_uverbs", "rdma_cm", "nvme", "nvme_core",
+                   "nvme_fabrics", "nvme_rdma", "sdxi_char", "rocm_xio")
+        self.assertEqual(qta.DIAG_MODULES, modules)
+        script_modules = qta._MODULE_PARAMETERS.splitlines()[0]
+        readme = (Path(qta.__file__).parent / "README.md").read_text()
+        row = next(line for line in readme.splitlines()
+                   if "module-parameters.txt" in line)
+        for module in modules:
+            self.assertIn(f" {module}", script_modules, module)
+            self.assertIn(f"`{module}`", row, module)
+        names = [name for name, _ in qta.GUEST_DIAGNOSTICS]
+        self.assertEqual(names, ["dmesg.txt", "lspci.txt", "lsblk.txt",
+                                 "lsmod.txt", "module-parameters.txt"])
+        commands = dict(qta.GUEST_DIAGNOSTICS)
+        self.assertIn("lspci -nnk", commands["lspci.txt"])
+        # The whole kernel log, not the end of it, and the P4 engine.
+        self.assertNotIn("tail", commands["dmesg.txt"])
+        self.assertIn("ernic_p4", qta.DIAG_MODULES)
+        self.assertIn(" ernic_p4 ", qta._MODULE_PARAMETERS)
+
+
+class UpWiring(unittest.TestCase):
+    """op_up and publish with everything that needs a runner stubbed out:
+    what each new input is handed to, and what the post step is left."""
+
+    def up(self, tmp, manifest=None, **given):
+        base = Path(tmp)
+        tool = {"tool": "/t/qemu-tool", "python": "/t/python",
+                "version": "2.1.0", "sha": ""}
+        calls = {"run": [], "run_within": [], "waited": []}
+        fleet = {"backing_ref": "r:1", "count": 2, "name_prefix": "ci",
+                 "rocjitsu_config": None}
+        manifest = manifest or [dict(vm, name=f"ci-{vm['index']}")
+                                for vm in VMS[:2]]
+
+        def waited(state, vms, *rest):
+            calls["waited"].append(json.loads(
+                Path(state["state_file"]).read_text()))
+        env = {"GITHUB_OUTPUT": str(base / "out"),
+               "GITHUB_STATE": str(base / "st"),
+               "GITHUB_ENV": str(base / "env"), "PATH": os.environ["PATH"]}
+        with mock.patch.dict(os.environ, env, clear=True), inputs(**given), \
+                mock.patch.multiple(
+                    qta,
+                    op_install=mock.Mock(return_value=tool),
+                    fleet_layers=mock.Mock(return_value=(["/f.xml"], [])),
+                    check_fleet=mock.Mock(return_value=fleet),
+                    seed_key=mock.Mock(),
+                    container_source=mock.Mock(
+                        return_value=("2.1.0", base / "pkg" / "qemu_tool")),
+                    in_container=mock.Mock(return_value=False),
+                    run=mock.Mock(side_effect=lambda cmd, **k:
+                                  calls["run"].append(cmd)),
+                    run_within=mock.Mock(side_effect=lambda cmd, sec, what,
+                                         **k: calls["run_within"].append(
+                                             (cmd, sec))),
+                    build_manifest=mock.Mock(return_value=manifest),
+                    wait_and_publish=mock.Mock(side_effect=waited),
+                    in_guests=mock.Mock()):
+            silently(qta.op_up, base)
+        return calls
+
+    def test_stack_timeout_bounds_quick_start_and_only_when_given(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = self.up(tmp)
+            self.assertEqual(calls["run_within"], [])
+            self.assertIn("quick-start", calls["run"][0])
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = self.up(tmp, stack_timeout="77")
+            self.assertEqual(calls["run"], [])
+            (command, seconds), = calls["run_within"]
+            self.assertEqual(seconds, 77)
+            self.assertEqual(command[:3], ["/t/qemu-tool", "quick-start", "up"])
+
+    def test_the_post_step_is_left_the_guests_and_what_was_asked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state, = self.up(tmp, diagnostics="true", metrics="true",
+                             gpu="optional")["waited"]
+            self.assertEqual([vm["name"] for vm in state["guests"]],
+                             ["ci-1", "ci-2"])
+            self.assertEqual(state["manifest"], [])   # not up yet
+            self.assertIs(state["diagnostics"], True)
+            self.assertIs(state["metrics"], True)
+            self.assertEqual(state["gpu_mode"], "optional")
+        with tempfile.TemporaryDirectory() as tmp:
+            state, = self.up(tmp)["waited"]
+            self.assertIs(state["diagnostics"], False)
+            self.assertIs(state["metrics"], False)
+            self.assertEqual(state["gpu_mode"], "true")
+
+    def test_aliases_are_checked_against_the_fleet_before_it_is_booted(self):
+        """With the fleet's count and prefix, before anything is recorded
+        for the post step, which is just before quick-start is run."""
+        for bad, why in (("a\nb\nc", "names guest 3"),
+                         ("ci-2", "would name both ci-2 and ci-1"),
+                         ("guest{index}\nx\nguest1", "would name both")):
+            recorded = []
+            with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+                    qta, "save_state",
+                    side_effect=lambda *a: recorded.append(a)), \
+                    self.assertRaises(qta.Failure, msg=bad) as ctx:
+                self.up(tmp, ssh_aliases=bad)
+            self.assertIn(why, str(ctx.exception))
+            self.assertEqual(recorded, [], bad)
+
+    def test_real_names_are_checked_before_the_waits(self):
+        """A fleet whose names are not <prefix>-<n> after all: still refused
+        before the waits, not once the fleet is up."""
+        odd = [dict(VMS[0], name="alpha"), dict(VMS[1], name="beta")]
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(qta, "save_state"), \
+                    self.assertRaises(qta.Failure) as ctx:
+                self.up(tmp, manifest=odd, ssh_aliases="beta")
+            self.assertIn("'beta' would name both beta and alpha",
+                          str(ctx.exception))
+
+    def test_publish_gives_the_guests_their_aliases(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp, "out")
+            state = {"state_file": str(Path(tmp, "action/ci/state.json"))}
+            Path(state["state_file"]).parent.mkdir(parents=True)
+            vms = [dict(vm) for vm in VMS[:2]]
+            with mock.patch.dict(os.environ, {"GITHUB_OUTPUT": str(out)},
+                                 clear=True), \
+                    inputs(ssh_aliases="guest guest{index}"):
+                qta.publish(state, vms)
+            self.assertEqual([vm["ssh_aliases"] for vm in vms],
+                             [["guest", "guest1", "vm1"], ["guest2", "vm2"]])
+            self.assertIn("Host g-1 guest guest1 vm1\n",
+                          Path(state["ssh_config"]).read_text())
+            self.assertIn('"ssh_aliases": ["guest2", "vm2"]', out.read_text())
+            written = json.loads(Path(state["state_file"]).read_text())
+            self.assertEqual(written["manifest"][0]["ssh_aliases"],
+                             ["guest", "guest1", "vm1"])
 
 
 class State(unittest.TestCase):
@@ -679,6 +1916,19 @@ class Reporting(unittest.TestCase):
                 qta.validate_guest_inputs()
         with mock.patch.dict(os.environ, {}, clear=True), inputs(wait_for="RDMA"):
             self.assertEqual(qta.validate_guest_inputs(), "rdma")
+
+    def test_an_exec_step_refuses_a_gpu_value_it_used_to_ignore(self):
+        """Before a fleet is looked for, so with none there to find."""
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                inputs(gpu="maybe", run="true"), \
+                mock.patch.object(qta, "load_state") as load, \
+                self.assertRaises(qta.Failure) as caught:
+            qta.op_exec()
+        self.assertIn("input gpu must be true, false, required or optional, "
+                      "not 'maybe'", str(caught.exception))
+        load.assert_not_called()
+        changelog = (Path(qta.__file__).parent / "CHANGELOG.md").read_text()
+        self.assertIn("`gpu` is validated on an `exec` step too", changelog)
 
     def test_mount_point_lookup(self):
         info = ("22 1 0:20 / / rw - overlay overlay rw\n"

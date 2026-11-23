@@ -7,7 +7,7 @@
   Every element is one qemu-tool documents in the fleet it ships,
   qemu/stacks/rocm-golden.xml in the qemu-minimal repository. A fleet XML
   is tied to the qemu-tool that reads it: an element a version does not
-  know is refused by name.
+  know is refused by name. This file reads on qemu-tool 2.1 and on 3.x.
 -->
 <fleet xmlns="http://qemu-tool/fleet/1.0">
 
@@ -36,8 +36,8 @@
        runner. Set them here and it leaves them as written. Four vCPUs is
        the least the RDMA driver in the default guest image probes on. -->
 
-  <!-- Every guest is an overlay on one copy of the guest image. -->
-  <vm-backing-shared>true</vm-backing-shared>
+  <!-- Every guest is an overlay on one copy of the guest image; a stack
+       always starts them that way and there is nothing to set for it. -->
   <!-- The guests' L2 network; without it there is no RDMA between them. -->
   <ernic-tap>true</ernic-tap>
 

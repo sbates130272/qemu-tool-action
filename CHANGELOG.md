@@ -7,6 +7,82 @@ that follow the newest matching release.
 
 ## [Unreleased]
 
+### Added
+
+- `gpu: required` brings up every guest it can and then fails the step
+  unless every guest ended with its GPU bound (`loaded`), naming each
+  guest that did not and its status; a guest with no GPU (`absent`) or no
+  `amdgpu-probe` (`unknown`) is a failure there. `gpu: optional` runs the
+  same bring-up and nothing in it fails the step.
+  `true` and `false` do what they did.
+- `diagnostics: true` writes, at teardown and whether the job passed or
+  not, a `diagnostics` directory under `logs-dir`: each guest's whole
+  `dmesg`, `lspci -nnk`, `lsblk`, `lsmod` and the parameters of the GPU,
+  NIC, NVMe and SDXI kernel modules, and the stack's resolved compose
+  configuration. Values in it are redacted by name (`password`, `secret`,
+  `token`, `api-key`, `*_KEY`, `*_PASS`, `*_AUTH` and the like), a
+  mapping or list under such a name whole, and the user part of a URL; a
+  secret under another name in an override file of yours is not, nor is
+  one glued to a short flag (`-pSECRET`). Best effort, bounded in time and
+  in bytes, and never a reason for teardown to fail. `NOTES.txt` and the
+  summary list what that teardown wrote: each guest's directory is
+  emptied first, so an earlier fleet's files are not shown as this one's.
+- `ssh-aliases`: your own Host names for the guests in the `ssh-config`
+  output, as a pattern (`guest{index}`), a name per guest, or both
+  (`guest guest{index}`). The guest's name stays, and so does `vm<n>`
+  unless you give that word to another guest. Each `vm-manifest` entry
+  gains `ssh_aliases`.
+- `stack-timeout`: a limit on `qemu-tool quick-start up`, the image pulls
+  and the start of the stack's containers, which had none. Off by default.
+  `wait-timeout` remains the limit on the guests' boot.
+- CI boots two guests through the action, with RDMA between them, on every
+  pull request, push to `main` and scheduled run; it was a manual job.
+
+### Changed
+
+- **The default `qemu-tool-version` is `>=2.1,<4`; it was `>=2.1,<3`.** A
+  job that does not pin now gets qemu-tool 3.x, where it got 2.1.0. The
+  2.1.0 README said a qemu-tool 3 would come with a new major version of
+  this action; it comes in this release instead, on `@v2`.
+  qemu-tool 3 refuses ten fleet XML elements that 2.x read:
+  `<qemu-digest>`, `<ernic-digest>`, `<rocjitsu-digest>`,
+  `<backing-digest>`, `<domain-pattern>`, `<prom-port>`, `<loki-port>`,
+  `<vm-backing-shared>`, `<ernic-subnet>` and `<ernic-mac-prefix>`. A
+  fleet XML started from this action's `examples/fleet-minimal.xml` as it
+  was in 2.1.0, or from one of the fleets qemu-tool 2.x shipped, sets
+  `<vm-backing-shared>` and is refused until that line is deleted. A
+  fleet XML of yours that sets any of the ten has to drop it, or the job
+  has to pin 2.x (`qemu-tool-version: '~=2.1'`); the README's "From
+  qemu-tool 2.x to 3.x" says what each was. qemu-tool 3 also starts every
+  guest with the CPU vendor `AuthenticAMD`, whatever the runner's CPU is.
+- Generating the GPU firmware (600 s) and copying it into a guest (300 s)
+  now have limits; they had none. A generation that runs out of time has
+  its container removed. A guest whose firmware install and GPU bind
+  overrun their 600 s fails the step with a one-line error; that was a
+  traceback.
+- When the GPU step fails, the outputs, `QEMU_TOOL_SSH_CONFIG` and the
+  step summary are written first, so they show the status each guest's GPU
+  was left in. The step fails as before. The fleet then counts as up for a
+  later `exec` step and for the guest logs collected at teardown.
+- Every guest's GPU status is read before the step fails on one of them;
+  it used to stop at the first.
+- `gpu` is validated on an `exec` step too, as are `stack-timeout`,
+  `ssh-aliases` and `diagnostics`: a `gpu` that is not `true`, `required`,
+  `optional` or `false` is now refused there, where it was ignored. An
+  `exec` step that carries a mistyped `gpu` fails until it is corrected
+  or removed.
+- `examples/fleet-minimal.xml` no longer sets `<vm-backing-shared>`.
+  qemu-tool 2.1.0 renders the same stack with and without it, and
+  qemu-tool 3 refuses a fleet file that sets it.
+- CI installs from the `v2.1.0` and `v3.0.0` tags of qemu-minimal, boots
+  the example fleet on each, and runs the smoke test on PyPI's 2.1.0 as
+  well as on the default.
+
+### Fixed
+
+- A whole-number input given a non-ASCII digit (`²`, `５`) is refused with
+  the usual one-line error; `²` was a traceback and `５` was accepted.
+
 ## [2.1.0] - 2026-11-20
 
 A fleet of your own becomes a documented, checked path; qemu-tool can be

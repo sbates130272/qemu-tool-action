@@ -19,6 +19,7 @@ import platform
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
@@ -92,7 +93,8 @@ def lines_of(name: str) -> list[str]:
 
 def whole_number(name: str, default: str) -> int:
     value = inp(name, default)
-    if not value.isdigit():
+    # isdigit() alone takes '²', which int() then refuses.
+    if not (value.isascii() and value.isdigit()):
         raise Failure(f"input {name} must be a whole number, not {value!r}")
     return int(value)
 
@@ -165,6 +167,49 @@ def run(cmd: list, check: bool = True, **kwargs) -> subprocess.CompletedProcess:
         raise Failure(f"`{shlex.join(argv[:3])} ...` exited "
                       f"{result.returncode}")
     return result
+
+
+def run_within(cmd: list, seconds: int, what: str, **kwargs) -> None:
+    """run(), given up on after `seconds`, with everything it started.
+
+    The command gets a process group of its own so that what it spawned,
+    `docker compose up` under quick-start for one, is stopped with it.
+    """
+    argv = [str(c) for c in cmd]
+    say(f"$ {shlex.join(argv)}")
+    try:
+        child = subprocess.Popen(argv, start_new_session=True, **kwargs)
+    except FileNotFoundError:
+        raise Failure(f"{argv[0]} is not on PATH") from None
+    try:
+        code = child.wait(timeout=seconds)
+    except subprocess.TimeoutExpired:
+        _stop_group(child)
+        raise Failure(f"{what} did not finish within {seconds} s") from None
+    except BaseException:
+        # An interrupted step: subprocess.run() kills its child on the way
+        # out, and a child in a session of its own gets no signal otherwise.
+        _stop_group(child)
+        raise
+    if code != 0:
+        raise Failure(f"`{shlex.join(argv[:3])} ...` exited {code}")
+
+
+def _stop_group(child: subprocess.Popen, grace: int = 15) -> None:
+    """End a run_within() command's whole process group.
+
+    SIGTERM, then SIGKILL to the group whether or not its leader went
+    quietly: something it started may have ignored the first.
+    """
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(child.pid, sig)
+        except OSError:
+            pass
+        try:
+            child.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            pass
 
 
 def quiet(cmd: list, **kwargs) -> subprocess.CompletedProcess:
@@ -344,7 +389,7 @@ def install_source(base: Path) -> dict:
         clean_copy(path, staged)
         return {"kind": "source", "spec": [str(staged)], "sha": "",
                 "checkout": "", "label": f"source {path}"}
-    version = version or ">=2.1,<3"
+    version = version or ">=2.1,<4"
     if version == "latest":
         spec = "qemu-tool"
     elif version[0].isdigit():
@@ -454,7 +499,7 @@ def install_qemu_tool(base: Path) -> dict[str, str]:
     say(f"qemu-tool {version_text}{where} at {tool}")
     if version_text[0].isdigit() and int(version_text.split(".")[0]) < 2:
         raise Failure(f"qemu-tool {version_text} is a 1.x release; this "
-                      "version of the action drives 2.x. Use "
+                      "version of the action drives 2.x and 3.x. Use "
                       "sbates130272/qemu-tool-action@v1 for 1.x.")
     set_output("qemu-tool-version", version_text)
     set_output("qemu-tool-path", tool)
@@ -951,6 +996,7 @@ def build_manifest(state: dict) -> list[dict]:
             "username": username,
             "ssh_key_file": str(key),
             "ssh_cmd": f"ssh -i {key} -p {port} {username}@{address}",
+            "ssh_aliases": [],
             "rdma_ip": own or (ips[0] if ips else None),
             "rdma_ips": ips,
             "nics": nics,
@@ -1106,6 +1152,12 @@ def firmware_set(vm: dict) -> str:
     return "full" if asked.stdout.strip() == "full" else "gap"
 
 
+# Limits on the GPU step's own commands; none is an input.
+GPU_FIRMWARE_SECONDS = 600   # generating a firmware set, on the runner
+GPU_COPY_SECONDS = 300       # copying it into one guest
+GPU_INSTALL_SECONDS = 600    # installing it and the 120 s wait for the GPU
+
+
 def generate_firmware(image: str, generation: str, fwset: str,
                       target: Path) -> None:
     """The firmware set of this stack's rocjitsu, as a tar on the runner."""
@@ -1113,22 +1165,48 @@ def generate_firmware(image: str, generation: str, fwset: str,
               f"--generation {shlex.quote(generation)} --set {fwset} "
               "--output /out >&2 && tar -cf - -C /out .")
     say(f"generating {generation} firmware ({fwset}) with {image}")
-    with open(target, "wb") as out:
-        made = subprocess.run(["docker", "run", "--rm", "--entrypoint",
-                               "/bin/sh", image, "-c", script], stdout=out)
+    # Named, so that it can be removed: stopping the docker client, which is
+    # all a timeout does, leaves the container running, and it carries no
+    # compose label for the teardown to find it by.
+    name = f"qta-firmware-{uuid.uuid4().hex[:12]}"
+    command = ["docker", "run", "--rm", "--name", name, "--entrypoint",
+               "/bin/sh", image, "-c", script]
+    try:
+        with open(target, "wb") as out:
+            made = subprocess.run(command, stdout=out,
+                                  timeout=GPU_FIRMWARE_SECONDS)
+    except FileNotFoundError:
+        raise Failure("docker is not on PATH; it generates the GPU "
+                      "firmware") from None
+    except subprocess.TimeoutExpired:
+        bounded(["docker", "rm", "-f", name], 60)
+        raise Failure("generating the GPU firmware from the rocjitsu image "
+                      f"{image} did not finish within "
+                      f"{GPU_FIRMWARE_SECONDS} s") from None
     if made.returncode != 0 or target.stat().st_size == 0:
         raise Failure("could not generate the GPU firmware from the "
                       f"rocjitsu image {image}")
 
 
 def bring_up_gpu(vm: dict, firmware: Path, fwset: str) -> None:
-    with open(firmware, "rb") as blob:
-        sent = subprocess.run(ssh_base(vm) + ["cat > /tmp/qt-action-fw.tar"],
-                              stdin=blob, capture_output=True)
+    try:
+        with open(firmware, "rb") as blob:
+            sent = subprocess.run(
+                ssh_base(vm) + ["cat > /tmp/qt-action-fw.tar"], stdin=blob,
+                capture_output=True, timeout=GPU_COPY_SECONDS)
+    except subprocess.TimeoutExpired:
+        raise Failure(f"{vm['name']}: copying the GPU firmware in did not "
+                      f"finish within {GPU_COPY_SECONDS} s") from None
     if sent.returncode != 0:
         raise Failure(f"{vm['name']}: could not copy the GPU firmware in")
-    done = quiet(ssh_base(vm) + ["bash -s"],
-                 input=f"fwset={fwset}\n{_GPU_INSTALL}", timeout=600)
+    try:
+        done = quiet(ssh_base(vm) + ["bash -s"],
+                     input=f"fwset={fwset}\n{_GPU_INSTALL}",
+                     timeout=GPU_INSTALL_SECONDS)
+    except subprocess.TimeoutExpired:
+        raise Failure(f"{vm['name']}: installing the GPU firmware and "
+                      "binding the GPU did not finish within "
+                      f"{GPU_INSTALL_SECONDS} s") from None
     say(f"  {vm['name']}: {(done.stdout.strip().splitlines() or ['no GPU'])[-1]}")
     if done.returncode != 0:
         say(done.stderr)
@@ -1149,49 +1227,242 @@ def gpu_generation(state: dict) -> str:
     return stem if re.match(r"^gfx[0-9]+$", stem) else "gfx1250"
 
 
-def setup_gpus(state: dict, manifest: list[dict]) -> None:
-    """Make each guest's emulated GPU usable, where it has one."""
+GPU_MODES = ("true", "required", "optional", "false")
+# What amdgpu-probe --status means by each word, for a message.
+GPU_STATES = {
+    "absent": "no AMD GPU on its PCI bus",
+    "nofirmware": "a GPU, and no firmware staged for it",
+    "ready": "a GPU with firmware staged, and amdgpu not loaded",
+    "unbound": "amdgpu loaded, and it bound no GPU",
+    "stranded": "amdgpu loaded with parameters other than the emulation's",
+    "unknown": "no amdgpu-probe in the guest image, or the guest did not "
+               "answer",
+}
+
+
+def gpu_mode() -> str:
+    """The gpu input: true, required, optional or false."""
+    value = inp("gpu").lower()
+    if value in ("required", "optional"):
+        return value
+    try:
+        return "true" if flag("gpu", True) else "false"
+    except Failure:
+        raise Failure("input gpu must be true, false, required or optional, "
+                      f"not {value!r}") from None
+
+
+def gpu_shortfall(manifest: list[dict]) -> str | None:
+    """With gpu: required, what is wrong; None when every GPU is bound."""
+    short = [vm for vm in manifest if vm["gpu"] != "loaded"]
+    if not short:
+        return None
+    return ("gpu: required, and " + "; ".join(
+        f"{vm['name']} is {vm['gpu']} "
+        f"({GPU_STATES.get(vm['gpu'], 'not a state this action knows')})"
+        for vm in short) + ". Every guest has to end as loaded.")
+
+
+def setup_gpus(state: dict, manifest: list[dict], mode: str = "true") -> None:
+    """Make each guest's emulated GPU usable, where it has one.
+
+    mode true: a guest with no GPU, or no amdgpu-probe, is left alone; one
+    whose GPU cannot be bound fails the step, at the first such problem.
+    required: every guest that can be brought up is, and the step then
+    fails unless every guest ended as loaded, naming all that did not.
+    optional: nothing here fails the step, whatever went wrong.
+    Every guest's final status is in its manifest entry whichever it is,
+    also when this raises.
+    """
+    problems: list[str] = []
+
+    def problem(message: str) -> None:
+        if mode == "true":
+            raise Failure(message)
+        problems.append(message)
+        if mode == "optional":
+            warn(f"gpu: optional, so not a failure: {message}")
+
     pending = []
+    stranded = []
     for vm in manifest:
         vm["gpu"] = gpu_status(vm)
         if vm["gpu"] in ("nofirmware", "ready", "unbound"):
             pending.append(vm)
         elif vm["gpu"] == "stranded":
-            raise Failure(f"{vm['name']}: amdgpu is loaded with parameters "
-                          "other than the emulation's; only a reboot of the "
-                          "guest clears that")
+            stranded.append(vm)
         elif vm["gpu"] == "unknown":
             say(f"  {vm['name']}: no amdgpu-probe in this guest image, so "
                 "its GPU is left as booted (gpu: false says so on purpose)")
         else:
             say(f"  {vm['name']}: GPU {vm['gpu']}, nothing to do")
-    if not pending:
+    for vm in stranded:
+        problem(f"{vm['name']}: amdgpu is loaded with parameters "
+                "other than the emulation's; only a reboot of the "
+                "guest clears that")
+    if pending:
+        shared, _hosts = read_inventory(state)
+        image = shared.get("fleet_guest_rocjitsu_image")
+        if not image:
+            problem("the generated fleet-inventory.yml names no rocjitsu "
+                    "image to take the GPU firmware from; set gpu: false "
+                    "and stage it yourself")
+            pending = []
+    if pending:
+        try:
+            sets = {vm["name"]: firmware_set(vm) for vm in pending}
+            tars = {}
+            for fwset in sorted(set(sets.values())):
+                tars[fwset] = (Path(state["state_file"]).parent
+                               / f"gpu-firmware-{fwset}.tar")
+                generate_firmware(image, gpu_generation(state), fwset,
+                                  tars[fwset])
+        except Failure as failure:
+            problem(str(failure))
+            pending = []
+        except Exception as exc:  # noqa: BLE001 - optional means optional
+            if mode != "optional":
+                raise
+            problem(f"{type(exc).__name__}: {exc}")
+            pending = []
+        failures: list[Exception] = []
+        with concurrent.futures.ThreadPoolExecutor(len(pending) or 1) as pool:
+            jobs = [(vm, pool.submit(bring_up_gpu, vm, tars[sets[vm["name"]]],
+                                     sets[vm["name"]])) for vm in pending]
+            for vm, job in jobs:
+                try:
+                    job.result()
+                except Exception as exc:  # noqa: BLE001 - the others still count
+                    failures.append(exc)
+                vm["gpu"] = gpu_status(vm)
+        for failure in failures:
+            if mode == "true" or (mode == "required"
+                                  and not isinstance(failure, Failure)):
+                raise failure
+            problem(str(failure) if isinstance(failure, Failure)
+                    else f"{type(failure).__name__}: {failure}")
+    if mode == "required":
+        short = gpu_shortfall(manifest)
+        if short:
+            raise Failure(" ".join([short, *problems]))
+        if problems:
+            raise Failure(problems[0])
+
+
+_ALIAS = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_ALIAS_INDEX = "{index}"
+DEFAULT_ALIASES = "vm{index}"
+
+
+def parse_aliases(text: str) -> tuple[list[str], list[list[str]]]:
+    """The ssh-aliases input: patterns for every guest, and names per guest.
+
+    A word containing {index} names every guest, with the guest's index in
+    its place. Any other word names one guest: the words of the first line
+    that has such a word the first guest, of the next such line the second,
+    and so on. Blank lines, comments and lines holding only {index} words
+    are no guest's line.
+    """
+    patterns: list[str] = []
+    per_guest: list[list[str]] = []
+    rows = [line.strip() for line in text.splitlines()]
+    rows = [row for row in rows if row and not row.startswith("#")]
+    for row in rows:
+        own: list[str] = []
+        for word in row.replace(",", " ").split():
+            probe = word.replace(_ALIAS_INDEX, "1")
+            if not _ALIAS.match(probe):
+                raise Failure(
+                    f"ssh-aliases: {word!r} cannot be an alias. Use letters, "
+                    "digits, '.', '_' and '-', starting with a letter or a "
+                    "digit, and {index} for the guest's number; ssh reads "
+                    "*, ? and ! in a Host line as patterns.")
+            if _ALIAS_INDEX in word:
+                if word not in patterns:
+                    patterns.append(word)
+            elif word in own or any(word in other for other in per_guest):
+                raise Failure(f"ssh-aliases: {word!r} is given twice; an "
+                              "alias names one guest")
+            else:
+                own.append(word)
+        if own:
+            per_guest.append(own)
+    return patterns, per_guest
+
+
+def guest_names(prefix: str | None, count: int) -> list[str]:
+    """The names qemu-tool gives a fleet's guests: <vm-name-prefix>-<n>.
+
+    Without a prefix, names no alias can be, for a check that only needs
+    the guests told apart.
+    """
+    return [f"{prefix}-{index}" if prefix else f"guest {index}"
+            for index in range(1, count + 1)]
+
+
+def check_aliases(text: str, count: int | None = None,
+                  prefix: str | None = None) -> None:
+    """Refuse what can be refused of ssh-aliases before a fleet is booted.
+
+    Without a count, the words alone. With the fleet's guest count, also a
+    name for a guest it does not have and two guests sharing one alias;
+    with its name prefix as well, an alias that is another guest's name.
+    """
+    _patterns, per_guest = parse_aliases(text or DEFAULT_ALIASES)
+    if not count:
         return
-    shared, _hosts = read_inventory(state)
-    image = shared.get("fleet_guest_rocjitsu_image")
-    if not image:
-        raise Failure("the generated fleet-inventory.yml names no rocjitsu "
-                      "image to take the GPU firmware from; set gpu: false "
-                      "and stage it yourself")
-    sets = {vm["name"]: firmware_set(vm) for vm in pending}
-    tars = {}
-    for fwset in sorted(set(sets.values())):
-        tars[fwset] = (Path(state["state_file"]).parent
-                       / f"gpu-firmware-{fwset}.tar")
-        generate_firmware(image, gpu_generation(state), fwset, tars[fwset])
-    with concurrent.futures.ThreadPoolExecutor(len(pending)) as pool:
-        jobs = [(vm, pool.submit(bring_up_gpu, vm, tars[sets[vm["name"]]],
-                                 sets[vm["name"]])) for vm in pending]
-        for vm, job in jobs:
-            job.result()
-            vm["gpu"] = gpu_status(vm)
+    named = len(per_guest)
+    if named > count:
+        raise Failure(f"ssh-aliases names guest {named} "
+                      f"({' '.join(per_guest[named - 1])}) and the fleet has "
+                      f"{count}. A line of the input is one guest; write "
+                      "{index} in a word to name every guest with it.")
+    assign_aliases([{"name": name, "index": index} for index, name
+                    in enumerate(guest_names(prefix, count), start=1)], text)
+
+
+def assign_aliases(manifest: list[dict], text: str) -> None:
+    """Set each guest's ssh_aliases: what the input asks for, then vm<n>.
+
+    The guest's own name is always a Host name too and is not listed. vm<n>
+    is kept beside whatever was asked for, unless the caller gave that very
+    word to another guest.
+    """
+    patterns, per_guest = parse_aliases(text or DEFAULT_ALIASES)
+    names = {vm["name"]: vm for vm in manifest}
+    taken: dict[str, dict] = {}
+    for position, vm in enumerate(manifest):
+        wanted = list(per_guest[position]) if position < len(per_guest) else []
+        wanted += [p.replace(_ALIAS_INDEX, str(vm["index"])) for p in patterns]
+        aliases: list[str] = []
+        for alias in wanted:
+            if alias == vm["name"] or alias in aliases:
+                continue
+            owner = taken.get(alias) or names.get(alias)
+            if owner is not None and owner is not vm:
+                raise Failure(f"ssh-aliases: {alias!r} would name both "
+                              f"{owner['name']} and {vm['name']}")
+            taken[alias] = vm
+            aliases.append(alias)
+        vm["ssh_aliases"] = aliases
+    for vm in manifest:
+        legacy = f"vm{vm['index']}"
+        if legacy not in taken and legacy not in names:
+            taken[legacy] = vm
+            vm["ssh_aliases"].append(legacy)
+    for position, words in enumerate(per_guest):
+        if words and position >= len(manifest):
+            warn(f"ssh-aliases: {' '.join(words)} names guest {position + 1} "
+                 f"and the fleet has {len(manifest)}")
 
 
 def write_ssh_config(manifest: list[dict], path: Path) -> None:
     entries = []
     for vm in manifest:
+        hosts = " ".join([vm["name"], *vm.get("ssh_aliases",
+                                               [f"vm{vm['index']}"])])
         entries.append(
-            f"Host {vm['name']} vm{vm['index']}\n"
+            f"Host {hosts}\n"
             f"  HostName {vm['ssh_host']}\n"
             f"  Port {vm['ssh_port']}\n"
             f"  User {vm['username']}\n"
@@ -1433,7 +1704,14 @@ def validate_guest_inputs() -> str:
     if wait_for not in ("ssh", "rdma", "none"):
         raise Failure(f"wait-for must be ssh, rdma or none, not {wait_for!r}")
     whole_number("wait-timeout", "900")
+    whole_number("stack-timeout", "0")
     whole_number("log-lines", "40")
+    check_aliases(inp("ssh-aliases"))
+    if inp("diagnostics"):
+        flag("diagnostics")
+    if gpu_mode() == "required" and wait_for == "none":
+        raise Failure("gpu: required needs the guests reachable; that "
+                      "cannot be combined with wait-for: none")
     for entry in lines_of("copy"):
         parse_copy(entry)
     for entry in lines_of("fetch"):
@@ -1501,6 +1779,7 @@ def load_state() -> dict:
 def publish(state: dict, manifest: list[dict]) -> None:
     action_dir = Path(state["state_file"]).parent
     ssh_config, inventory = action_dir / "ssh_config", action_dir / "inventory.yml"
+    assign_aliases(manifest, inp("ssh-aliases"))
     write_ssh_config(manifest, ssh_config)
     write_inventory(manifest, inventory)
     state.update(manifest=manifest, ssh_config=str(ssh_config),
@@ -1514,18 +1793,21 @@ def publish(state: dict, manifest: list[dict]) -> None:
     export_env("QEMU_TOOL_SSH_CONFIG", str(ssh_config))
 
 
-def summarise(state: dict, manifest: list[dict], seconds: float) -> None:
+def summarise(state: dict, manifest: list[dict], seconds: float,
+              gpu_failure: str = "") -> None:
     rows = "".join(
         f"| `{vm['name']}` | `{vm['ssh_host']}:{vm['ssh_port']}` | "
         f"`{vm['username']}` | {vm['gpu'] or ''} | "
         f"{vm['rdma_device'] or ''} | {vm['rdma_ip'] or ''} |\n"
         for vm in manifest)
+    failed = (f"**The GPU step failed** (`gpu: {state.get('gpu_mode')}`): "
+              f"{gpu_failure}\n\n" if gpu_failure else "")
     _append("GITHUB_STEP_SUMMARY",
             f"### qemu-tool fleet `{state['stack_name']}`\n\n"
             f"{len(manifest)} guest(s) up in {int(seconds)}s with qemu-tool "
             f"{state['version']}.\n\n"
             "| Guest | SSH | User | GPU | RDMA device | RDMA address |\n"
-            "|---|---|---|---|---|---|\n" + rows + "\n")
+            "|---|---|---|---|---|---|\n" + rows + "\n" + failed)
 
 
 # ── Operations ───────────────────────────────────────────────────────────────
@@ -1567,10 +1849,44 @@ def absolute_paths(arguments: list[str], against: Path) -> list[str]:
     return out
 
 
+def wait_and_publish(state: dict, manifest: list[dict], wait_for: str,
+                     gpus: str, started: float) -> None:
+    """Wait for the guests, bring up their GPUs, and say what came up.
+
+    A failure of the GPU step is raised last, once the outputs, the state
+    and the summary carry the status every guest's GPU was left in.
+    """
+    deadline = time.monotonic() + whole_number("wait-timeout", "900")
+    gpu_failure: Exception | None = None
+    if wait_for != "none":
+        with group("Wait for the guests"):
+            wait_for_ssh(state, manifest, deadline)
+            if wait_for == "rdma":
+                wait_for_rdma(manifest, deadline)
+        if gpus != "false":
+            with group("Bring up the emulated GPUs"):
+                try:
+                    setup_gpus(state, manifest, gpus)
+                except Exception as failure:  # noqa: BLE001 - raised below
+                    gpu_failure = failure
+                for vm in manifest:
+                    say(f"  {vm['name']}: GPU {vm['gpu']}")
+    elif gpus != "false":
+        say("wait-for: none, so the emulated GPUs are left unprobed")
+    publish(state, manifest)
+    summarise(state, manifest, time.monotonic() - started,
+              str(gpu_failure or ""))
+    for vm in manifest:
+        say(f"{vm['name']}: {vm['ssh_cmd']}")
+    if gpu_failure is not None:
+        raise gpu_failure
+
+
 def op_up(base: Path) -> None:
     started = time.monotonic()
     wait_for = validate_guest_inputs()
-    want_gpu = flag("gpu", True)
+    gpus = gpu_mode()
+    stack_limit = whole_number("stack-timeout", "0")
     stack_dir = Path(inp("stack-dir")
                      or base / "stacks" / inp("stack-name", "ci")
                      ).expanduser().resolve()
@@ -1605,6 +1921,9 @@ def op_up(base: Path) -> None:
                        else flag("in-network")),
         "layers": [],
         "manifest": [],
+        "gpu_mode": gpus,
+        "metrics": flag("metrics"),
+        "diagnostics": flag("diagnostics"),
     }
     action_dir = Path(state["state_file"]).parent
     action_dir.mkdir(parents=True, exist_ok=True)
@@ -1614,6 +1933,8 @@ def op_up(base: Path) -> None:
                                             action_dir, elements)
         say("layers: " + " + ".join(state["layers"]))
         state["fleet"] = check_fleet(tool, state["layers"])
+        check_aliases(inp("ssh-aliases"), state["fleet"].get("count"),
+                      state["fleet"].get("name_prefix"))
         seeded = bool(inp("ssh-key-file"))
         if not state["fleet"].get("backing_ref"):
             if not seeded or flag("clean-overlays", True):
@@ -1688,7 +2009,13 @@ def op_up(base: Path) -> None:
         # Not from the workspace: quick-start looks for a qemu-minimal
         # checkout above its working directory and, finding one, gives the
         # containers that tree in place of the one just placed for them.
-        run(command, cwd=action_dir)
+        if stack_limit:
+            run_within(command, stack_limit,
+                       "`qemu-tool quick-start up` (the image pulls and the "
+                       "start of the stack's containers; stack-timeout)",
+                       cwd=action_dir)
+        else:
+            run(command, cwd=action_dir)
         if state["in_network"]:
             me = Path("/etc/hostname").read_text().strip()
             joined = quiet(["docker", "network", "connect",
@@ -1700,21 +2027,15 @@ def op_up(base: Path) -> None:
             write_state(state)
 
     manifest = build_manifest(state)
-    deadline = time.monotonic() + whole_number("wait-timeout", "900")
-    if wait_for != "none":
-        with group("Wait for the guests"):
-            wait_for_ssh(state, manifest, deadline)
-            if wait_for == "rdma":
-                wait_for_rdma(manifest, deadline)
-        if want_gpu:
-            with group("Bring up the emulated GPUs"):
-                setup_gpus(state, manifest)
-    elif want_gpu:
-        say("wait-for: none, so the emulated GPUs are left unprobed")
-    publish(state, manifest)
-    summarise(state, manifest, time.monotonic() - started)
-    for vm in manifest:
-        say(f"{vm['name']}: {vm['ssh_cmd']}")
+    # Not yet the manifest of a fleet that is up, which is what `exec` asks
+    # for: who the guests are, for diagnostics of a fleet that never got
+    # that far.
+    state["guests"] = manifest
+    write_state(state)
+    # Again, on the names the guests really have and before the waits, so
+    # that publish() cannot fail on an alias once the fleet is up.
+    assign_aliases([dict(vm) for vm in manifest], inp("ssh-aliases"))
+    wait_and_publish(state, manifest, wait_for, gpus, started)
     in_guests(state, manifest)
 
 
@@ -1799,6 +2120,345 @@ def collect_logs(state: dict, tail: int) -> None:
     say(f"logs written to {logs}")
 
 
+# ── Diagnostics (opt-in, at teardown) ────────────────────────────────────────
+#
+# Best effort throughout: every command has a limit of its own, a guest
+# that does not answer costs one connection attempt, and nothing here can
+# fail a step or keep the fleet from being torn down.
+
+DIAG_BYTES = 4 * 1024 * 1024   # of each file as written, in bytes
+DIAG_SECONDS = 45              # for each command
+DIAG_GUEST_SECONDS = 120       # for one guest, after which the rest is skipped
+# The drivers of what a fleet can put in a guest: the GPU, the RDMA NIC and
+# its P4 engine, NVMe and NVMe over fabrics, SDXI, and rocm-xio.
+DIAG_MODULES = ("amdgpu", "ionic", "ionic_rdma", "ernic_p4", "ib_core",
+                "ib_uverbs", "rdma_cm", "nvme", "nvme_core", "nvme_fabrics",
+                "nvme_rdma", "sdxi_char", "rocm_xio")
+
+_MODULE_PARAMETERS = r"""for m in %s; do
+  d=/sys/module/$m
+  if [ ! -d "$d" ]; then echo "$m: not loaded"; continue; fi
+  if [ ! -d "$d/parameters" ]; then echo "$m: loaded, no parameters"; continue; fi
+  for p in "$d"/parameters/*; do
+    [ -e "$p" ] || continue
+    v=$(cat "$p" 2>/dev/null || sudo -n cat "$p" 2>/dev/null || echo '(unreadable)')
+    printf '%%s/%%s=%%s\n' "$m" "${p##*/}" "$(printf '%%s' "$v" | tr '\n' ' ')"
+  done
+done""" % " ".join(DIAG_MODULES)
+
+GUEST_DIAGNOSTICS = (
+    ("dmesg.txt", "sudo -n dmesg || dmesg"),
+    ("lspci.txt", "lspci -nnk"),
+    ("lsblk.txt", "lsblk -o NAME,MAJ:MIN,SIZE,TYPE,TRAN,MODEL,SERIAL,"
+                  "PHY-SEC,LOG-SEC,MOUNTPOINT || lsblk"),
+    ("lsmod.txt", "lsmod"),
+    ("module-parameters.txt", _MODULE_PARAMETERS),
+)
+
+# Redaction goes by NAMES, not by values: a value is taken out when the
+# key, variable or flag it belongs to reads like a credential. A secret
+# under a name that does not, or with no name at all, is not seen.
+# `token`, not `tokenizer`: the settings of a model server are full of the
+# second, and a diagnostics reader wants them.
+_SECRET_WORD = (r"pass(?:word|wd|phrase)|secret|token(?!iz)|credential"
+                r"|api[_-]?key|private[_-]?key")
+_NAME = r"[A-Za-z0-9_.-]"
+# What a name may end in, or be, to count: KEY, KEY_ID, PASS, AUTH.
+_SECRET_TAIL = r"(?:key(?:[_-]?id)?|pass|auth)"
+# A count or a limit is not a credential: MAX_TOKENS, --num-tokens.
+_NOT_A_COUNT = r"(?!-{0,2}(?:max|min|num)[_.-])"
+# A value as it stands in a command line. docker compose writes a string
+# holding `: ` single-quoted with the quotes inside it doubled, so a quoted
+# value arrives as ''like this''; that form has to be tried before the
+# plain one, which would match its first two quotes and stop.
+_SECRET_VALUE = r"\"[^\"]*\"|''[^']*''|'[^']*'"
+# A whole name that is one: a word above anywhere in it, or the name being
+# KEY, KEY_ID, PASS or AUTH or ending in one after a `_`, `.` or `-`
+# (SMTP_PASS, not PGPASS), or being AUTHORIZATION or COOKIE.
+_SECRET_NAME = (_NOT_A_COUNT
+                + r"(?:" + _NAME + r"*(?:" + _SECRET_WORD + r")" + _NAME + r"*"
+                r"|(?:" + _NAME + r"*[_.-])?" + _SECRET_TAIL
+                + r"|authorization|cookie)")
+# The same, for a flag: --db-password, --smtp-pass, --auth.
+_SECRET_FLAG_NAME = (_NOT_A_COUNT + r"--?(?:[A-Za-z0-9-]*(?:" + _SECRET_WORD
+                     + r")[A-Za-z0-9-]*|(?:[A-Za-z0-9-]*-)?" + _SECRET_TAIL
+                     + r")")
+# KEY: value, KEY=value and - KEY=value.
+_SECRET_PAIR = re.compile(
+    r"^(\s*(?:-\s+)?[\"']?" + _SECRET_NAME + r"[\"']?\s*[:=]\s*)(\S.*)$",
+    re.IGNORECASE)
+# A block scalar's header: the value is the more-indented lines after it.
+_BLOCK_SCALAR = re.compile(r"^[|>][0-9+-]*\s*(?:#.*)?$")
+# --some-password value and --some-password=value, inside a command line.
+# Not from inside a longer flag: the `-tokens` of `--max-tokens` is not one.
+_SECRET_FLAG = re.compile(
+    r"(?<![A-Za-z0-9-])(" + _SECRET_FLAG_NAME + r"(?:=|\s+))"
+    r"(" + _SECRET_VALUE + r"|(?:[^\s\"';&|]|[;&|](?=[^\s\"']))+)",
+    re.IGNORECASE)
+# An unquoted value stops at a shell separator that ends its word
+# (`--token=x; next`), so the command line reads as it was; one inside the
+# word (`--token=a;b`) is part of the value.
+# name=value inside a longer value: a DSN, a query string, a backend's
+# comma-separated options.
+_SECRET_INLINE = re.compile(
+    r"(?<![A-Za-z0-9_.-])(" + _NOT_A_COUNT + r"(?:" + _NAME + r"*(?:"
+    + _SECRET_WORD + r")" + _NAME + r"*|(?:" + _NAME + r"*[_.-])?"
+    + _SECRET_TAIL + r")=)(?!\[redacted\])(" + _SECRET_VALUE
+    + r"|[^\s\"',;&]+)",
+    re.IGNORECASE)
+# A list item that is such a flag alone: its value is the next item.
+_SECRET_ITEM = re.compile(
+    r"^\s*-\s+[\"']?" + _SECRET_FLAG_NAME + r"[\"']?\s*$", re.IGNORECASE)
+# An Authorization header's value, wherever it is.
+_SECRET_BEARER = re.compile(
+    r"\b(Bearer|Basic|Token)\s+[A-Za-z0-9._~+/=-]{8,}")
+# A URL carrying user:password@, the user possibly empty (redis://:pw@host).
+_SECRET_URL = re.compile(r"(://[^/\s:@]*:)[^@\s/]+@")
+# A URL whose whole userinfo is one word (https://TOKEN@host/): a token as
+# often as a user name, and nothing tells them apart, so it goes.
+_SECRET_URL_USER = re.compile(r"(://)[^/\s:@\[\]]+@(?=[^/\s@])")
+# A secret-named key with nothing after it: its value is the mapping or
+# the list on the more-indented lines that follow.
+_SECRET_PARENT = re.compile(
+    r"^(\s*(?:-\s+)?[\"']?" + _SECRET_NAME + r"[\"']?\s*:)\s*(?:#.*)?$",
+    re.IGNORECASE)
+# Not at this column: in a rendered compose file that is where the names of
+# services, networks and volumes are, and a service called `auth` is not a
+# credential. The top-level `secrets:` is taken whole all the same.
+_NAMES_COLUMN = 2
+# Nor where a service refers to one by name: the keys directly under its
+# `depends_on:` and `networks:`, which are at this column.
+_NAME_REFS = re.compile(r"^ {4}(?:depends_on|networks):\s*(?:#.*)?$")
+
+
+def redact(text: str) -> str:
+    """A rendered compose file without the values named like credentials.
+
+    By name only; see the note above _SECRET_WORD.
+    """
+    out = []
+    next_item = False
+    block: int | None = None   # column of the key whose block is being cut
+    parent: int | None = None  # index in out of a key waiting for children
+    refs: int | None = None    # column of the names a service refers to
+    for line in text.splitlines():
+        indent = len(line) - len(line.lstrip())
+        if block is not None:
+            # More indented, or a list at the key's own column, which YAML
+            # allows for a key's value (`password:` then `- x` under the p).
+            if (not line.strip() or indent > block or
+                    (indent == block and re.match(r"-(?:\s|$)", line.strip()))):
+                if parent is not None and line.strip():
+                    out[parent] = (out[parent].split("#")[0].rstrip()
+                                   + " [redacted]")
+                    parent = None
+                continue
+            block = parent = None
+        if refs is not None and line.strip():
+            if indent <= 4:
+                refs = None
+            elif refs < 0:
+                refs = indent
+        if _NAME_REFS.match(line):
+            refs = -1          # the first line under it says the column
+        if next_item and re.match(r"^\s*-\s+\S", line):
+            line = re.sub(r"^(\s*-\s+).*$", r"\1[redacted]", line)
+            next_item = False
+        else:
+            next_item = bool(_SECRET_ITEM.match(line))
+            pair = _SECRET_PAIR.match(line)
+            if pair and _BLOCK_SCALAR.match(pair.group(2)):
+                # Keep the header, so the file still parses, and replace
+                # every line of the block with one.
+                block = len(re.match(r"^\s*(?:-\s+)?", line).group(0))
+                out.append(line)
+                given = re.search(r"[1-9]", pair.group(2).split("#")[0])
+                out.append(" " * (block + int(given.group(0) if given else 2))
+                           + "[redacted]")
+                continue
+            nested = _SECRET_PARENT.match(line)
+            column = len(re.match(r"^\s*(?:-\s+)?", line).group(0))
+            referred = refs is not None and indent == refs == column
+            if nested and column != _NAMES_COLUMN and not referred:
+                block, parent = column, len(out)
+                out.append(line)
+                continue
+            if not referred:
+                line = _SECRET_PAIR.sub(r"\1[redacted]", line)
+            line = _SECRET_FLAG.sub(r"\1[redacted]", line)
+            line = _SECRET_INLINE.sub(r"\1[redacted]", line)
+        line = _SECRET_BEARER.sub(r"\1 [redacted]", line)
+        line = _SECRET_URL.sub(r"\1[redacted]@", line)
+        out.append(_SECRET_URL_USER.sub(r"\1[redacted]@", line))
+    return "\n".join(out) + ("\n" if text.endswith("\n") else "")
+
+
+def want_diagnostics(state: dict) -> bool:
+    """This step's diagnostics input, else what the `up` step was given."""
+    try:
+        if inp("diagnostics"):
+            return flag("diagnostics")
+    except Failure as failure:
+        warn(str(failure))
+        return False
+    return bool(state.get("diagnostics"))
+
+
+def _last_bytes(text: str, limit: int) -> bytes:
+    """The end of text as UTF-8, in at most limit bytes, on a character.
+
+    In bytes, because that is what the file is: output that is not UTF-8
+    is read with a three-byte replacement for each bad byte, so a count of
+    characters let a file reach three times the limit.
+    """
+    data = text.encode("utf-8", "replace")[-limit:] if limit > 0 else b""
+    skip = 0
+    while skip < min(3, len(data)) and data[skip] & 0xC0 == 0x80:
+        skip += 1
+    return data[skip:]
+
+
+def _first_bytes(text: str, limit: int) -> bytes:
+    """The start of text as UTF-8, in at most limit bytes, on a character."""
+    data = text.encode("utf-8", "replace")[:max(limit, 0)]
+    return data.decode("utf-8", "ignore").encode("utf-8")
+
+
+def _cleared(path: Path) -> None:
+    """Remove what an earlier collection left at path, whatever it is."""
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    elif path.is_symlink() or path.exists():
+        path.unlink()
+
+
+def guest_diagnostics(vm: dict, target: Path) -> list[str]:
+    """One guest's files, under its own directory. Returns what is missing.
+
+    The directory is emptied first, so what it holds afterwards is what
+    this call wrote: a guest that no longer answers is not left showing
+    the files of an earlier fleet of the same name.
+
+    Each command is stopped in the guest when its time is up, so what it
+    had printed by then still arrives; the limit on this side is a backstop
+    for a guest that stops answering altogether.
+    """
+    _cleared(target)
+    if bounded(ssh_base(vm) + ["true"], 30).returncode != 0:
+        return [f"{vm['name']}: did not answer SSH, nothing collected"]
+    target.mkdir(parents=True, exist_ok=True)
+    missing = []
+    began = time.monotonic()
+    for name, command in GUEST_DIAGNOSTICS:
+        if time.monotonic() - began > DIAG_GUEST_SECONDS:
+            missing.append(f"{vm['name']}: {name} skipped, the guest had "
+                           f"used its {DIAG_GUEST_SECONDS} s")
+            continue
+        remote = "bash -o pipefail -c " + shlex.quote(
+            f"timeout -k 5 {DIAG_SECONDS} bash -c {shlex.quote(command)} "
+            f"2>&1 | tail -c {DIAG_BYTES}")
+        got = bounded(ssh_base(vm) + [remote], DIAG_SECONDS + 20)
+        body = _last_bytes(got.stdout or "", DIAG_BYTES)
+        if body:
+            (target / name).write_bytes(body)
+        if got.returncode != 0:
+            why = ("timed out" if got.returncode in (124, 137)
+                   else f"exited {got.returncode}")
+            missing.append(f"{vm['name']}: {name} {why}"
+                           + (", what it had printed was kept" if body
+                              and got.returncode in (124, 137)
+                              else "" if body else ", nothing written"))
+    return missing
+
+
+def compose_config(state: dict, target: Path) -> str | None:
+    """The stack as docker compose resolves it, with credentials taken out.
+
+    Through `qemu-tool compose`, which is how the action drives the stack,
+    so the interpolated names are answered the way they were at `up`.
+    Returns why it could not be written, or None.
+    """
+    stack_dir = Path(state["stack_dir"])
+    tool = state.get("tool") or shutil.which("qemu-tool")
+    if not (stack_dir / "docker-compose.yml").is_file():
+        return "compose-config.yml: the stack was never generated"
+    if not tool or not Path(tool).is_file():
+        return "compose-config.yml: no qemu-tool to render it with"
+    command = [tool, "compose", "--stack-dir", stack_dir]
+    if state.get("images_dir"):
+        command += ["--images", state["images_dir"]]
+    if state.get("metrics"):
+        command += ["--profile", "metrics"]
+    # quick-start starts the stack with the source mount on the stack itself.
+    env = dict(os.environ, QEMU_TOOL_SRC=str(stack_dir))
+    got = bounded(command + ["config"], 60, env=env)
+    if got.returncode != 0 or not got.stdout.strip():
+        return (f"compose-config.yml: `qemu-tool compose config` "
+                f"{'timed out' if got.returncode == 124 else 'failed'}: "
+                f"{got.stderr.strip()[-300:]}")
+    # The start of it, unlike a guest's files: a cut YAML file reads from
+    # its top.
+    target.write_bytes(_first_bytes(redact(got.stdout), DIAG_BYTES))
+    return None
+
+
+def collect_diagnostics(state: dict) -> list[str]:
+    """What the diagnostics input asks for. Returns what could not be had."""
+    target = Path(state["logs_dir"]) / "diagnostics"
+    target.mkdir(parents=True, exist_ok=True)
+    # A work-dir that outlives the job, or a second `up` in one, finds an
+    # earlier collection here. Only what this call writes is reported.
+    config = target / "compose-config.yml"
+    for stale in (config, target / "NOTES.txt"):
+        _cleared(stale)
+    missing: list[str] = []
+    guests = state.get("manifest") or state.get("guests") or []
+    if not guests:
+        missing.append("guests: the fleet never got as far as having any")
+    else:
+        with concurrent.futures.ThreadPoolExecutor(len(guests)) as pool:
+            jobs = [(vm, pool.submit(guest_diagnostics, vm,
+                                     target / vm["name"])) for vm in guests]
+            for vm, job in jobs:
+                try:
+                    missing += job.result()
+                except Exception as exc:  # noqa: BLE001 - keep the others
+                    missing.append(f"{vm['name']}: {type(exc).__name__}: {exc}")
+    try:
+        problem = compose_config(state, config)
+    except Exception as exc:  # noqa: BLE001 - the guests' files stand
+        problem = f"compose-config.yml: {type(exc).__name__}: {exc}"
+    if problem:
+        missing.append(problem)
+    mine = [target / vm["name"] for vm in guests]
+    files = sorted(str(path.relative_to(target)) for directory in mine
+                   if directory.is_dir() for path in directory.rglob("*")
+                   if path.is_file())
+    if config.is_file():
+        files.append(config.name)
+    earlier = sorted(
+        str(path.relative_to(target)) for path in target.rglob("*")
+        if path.is_file() and path != config
+        and not any(directory in path.parents for directory in mine))
+    notes = (["Collected:"] + ([f"  {name}" for name in files] or ["  nothing"])
+             + ["", "Not collected:"]
+             + ([f"  {line}" for line in missing] or ["  nothing"]))
+    if earlier:
+        notes += ["", "Left by an earlier collection, not part of this one:"]
+        notes += [f"  {name}" for name in earlier]
+    (target / "NOTES.txt").write_text("\n".join(notes) + "\n")
+    say(f"diagnostics written to {target}: {len(files)} file(s)")
+    for line in missing:
+        warn(f"diagnostics: {line}")
+    _append("GITHUB_STEP_SUMMARY",
+            f"### qemu-tool diagnostics of `{state['stack_name']}`\n\n"
+            f"{len(files)} file(s) in `{target}`.\n\n"
+            + ("Not collected:\n\n" + "".join(
+                f"- {line}\n" for line in missing) if missing
+               else "Nothing was missed.\n") + "\n")
+    return missing
+
+
 def teardown(state: dict) -> None:
     stack, stack_dir = state["stack_name"], Path(state["stack_dir"])
     if not project_containers(stack):
@@ -1809,6 +2469,12 @@ def teardown(state: dict) -> None:
         collect_logs(state, int(lines) if lines.isdigit() else 40)
     except Exception as exc:  # noqa: BLE001 - logs must never block teardown
         warn(f"collecting the logs of stack {stack} failed: {exc}")
+    if want_diagnostics(state):
+        try:
+            with group(f"Diagnostics of stack {stack}"):
+                collect_diagnostics(state)
+        except Exception as exc:  # noqa: BLE001 - nor may these
+            warn(f"collecting the diagnostics of stack {stack} failed: {exc}")
     with group(f"Tear down stack {stack}"):
         if state.get("joined"):
             quiet(["docker", "network", "disconnect", "-f",

@@ -6,7 +6,8 @@ GitHub only updates from the release's web page.
 1. On a branch: move the `[Unreleased]` entries of `CHANGELOG.md` under
    `## [X.Y.Z] - YYYY-MM-DD`, update the link list at its foot, and for a new
    major version change the `@vN` in the README's examples. Merge to `main`
-   with CI green, the `boot` job included.
+   with CI green, the three boot jobs included (`boot`, `boot-own` and the
+   two-guest `boot-two`).
 
 2. Tag and push:
 
