@@ -25,7 +25,9 @@ inputs:
   qemu-tool-version:
     description: >-
       A release of qemu-tool from PyPI: a version (2.1.0), a pip specifier
-      or "latest". Default, when none of the three is given: ">=2.1,<3".
+      or "latest". Default, when none of the three is given: ">=2.1,<4",
+      the newest 2.x or 3.x release. qemu-tool 3 refuses ten fleet XML
+      elements that 2.x read; see "From qemu-tool 2.x to 3.x" in the README.
     required: false
   qemu-tool-ref:
     description: >-
@@ -127,7 +129,13 @@ inputs:
       rocjitsu serving it and load amdgpu with the emulation's parameters.
       Without this the GPU is on the guest's PCI bus and nothing more.
       Guests whose image has no amdgpu-probe are left as booted. Set false
-      to do it yourself.
+      to do it yourself. true (default): a guest with no GPU, or no
+      amdgpu-probe, is not a failure; a GPU that cannot be bound is.
+      required: every guest that can be brought up is, and the step then
+      fails unless every guest ended with its GPU bound (status loaded),
+      naming each guest that did not and its status. optional: the same
+      bring-up, and nothing in it fails the step. Each
+      guest's final status is in vm-manifest and the step summary.
     required: false
     default: 'true'
   gpu-generation:
@@ -143,9 +151,32 @@ inputs:
     required: false
     default: ssh
   wait-timeout:
-    description: Seconds to wait for the guests.
+    description: >-
+      Seconds to wait for the guests once the stack is up: for every guest
+      to answer SSH and, with wait-for: rdma, for its RDMA port. This is
+      the limit on how long the guests may take to boot.
     required: false
     default: '900'
+  stack-timeout:
+    description: >-
+      Seconds `qemu-tool quick-start up` may take: pulling the guest image
+      and the container images, and starting the stack's containers. It
+      comes before wait-timeout, which does not cover it. 0 (default): no
+      limit but the job's.
+    required: false
+    default: '0'
+  ssh-aliases:
+    description: >-
+      Extra Host names for the guests in the ssh-config output, beside each
+      guest's own name. A word containing {index} names every guest, with
+      the guest's number in its place; any other word names one guest, the
+      words of the first line that has one the first guest, of the next
+      such line the second. Blank lines, comments and lines of {index}
+      words alone are no guest's line. `guest guest{index}` gives guest and
+      guest1 for the first guest and guest2 for the second. Default:
+      vm{index}, which is kept as well whatever is given here, unless you
+      give that very word to another guest.
+    required: false
   ssh-key-file:
     description: >-
       Private key the guests accept, for a guest image that was not
@@ -174,6 +205,21 @@ inputs:
     description: Lines of each container's log printed at teardown. 0 prints none; all of it is written to logs-dir either way.
     required: false
     default: '40'
+  diagnostics:
+    description: >-
+      Set true to also write, at teardown and whether the job passed or
+      not, a diagnostics directory under logs-dir: for each guest its whole
+      dmesg, `lspci -nnk`, lsblk, lsmod and the parameters of the GPU, NIC,
+      NVMe and SDXI kernel modules, and the stack's resolved compose
+      configuration. Values in that file are redacted by name: those of
+      keys, variables and flags named like a credential (password, secret,
+      token, api-key, *_KEY, *_PASS, *_AUTH and the like). A secret under
+      any other name, in a docker-compose.override.yml of yours or passed
+      through from the runner's environment, is written as it is, so read
+      the file before uploading it. Best effort: a guest that does not
+      answer is noted and skipped. Default false. On operation: down, the
+      default is what the up step was given.
+    required: false
   extra-args:
     description: >-
       Further flags for `qemu-tool quick-start up`. A relative path given
@@ -246,8 +292,8 @@ outputs:
   vm-manifest:
     description: >-
       JSON array, one object per guest: name, index, ssh_host, ssh_port,
-      username, ssh_key_file, ssh_cmd, rdma_ip, rdma_ips, nics,
-      rdma_device, gpu.
+      username, ssh_key_file, ssh_cmd, ssh_aliases, rdma_ip, rdma_ips,
+      nics, rdma_device, gpu.
   vm-names:
     description: The guest names, space separated.
   vm-count:

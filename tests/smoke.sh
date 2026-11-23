@@ -4,7 +4,8 @@
 # then check the two things the action assumes about qemu-tool that only a
 # real install can show. Boots nothing.
 #
-#   tests/smoke.sh                 qemu-tool from PyPI
+#   tests/smoke.sh                 qemu-tool from PyPI, the action's default
+#   QEMU_TOOL_VERSION=2.1.0 tests/smoke.sh      that release from PyPI
 #   tests/smoke.sh SOURCE_DIR      from the qemu/ directory of a checkout
 set -euo pipefail
 
@@ -13,6 +14,9 @@ scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
 for f in out env path state summary; do : > "$scratch/$f"; done
 source_dir=${1:-}
+# A version is only given when no source is: the action takes one or the other.
+asked=
+[ -n "$source_dir" ] || asked=${QEMU_TOOL_VERSION:-}
 
 act() {
   env GITHUB_OUTPUT="$scratch/out" GITHUB_ENV="$scratch/env" \
@@ -20,7 +24,8 @@ act() {
       GITHUB_STEP_SUMMARY="$scratch/summary" RUNNER_TEMP="$scratch" \
       GITHUB_RUN_ID=1 GITHUB_JOB=smoke \
       "INPUT_WORK-DIR=$scratch/work" "INPUT_SETUP-HOST=false" \
-      "INPUT_QEMU-TOOL-SOURCE=$source_dir" "INPUT_OPERATION=$1" \
+      "INPUT_QEMU-TOOL-SOURCE=$source_dir" \
+      "INPUT_QEMU-TOOL-VERSION=$asked" "INPUT_OPERATION=$1" \
       "INPUT_ARGS=$2" \
       python3 "$here/qemu_tool_action.py" main
 }
@@ -36,6 +41,11 @@ grep -q "^qemu-tool-version<<" "$scratch/out" || fail "no qemu-tool-version outp
 tool="$scratch/work/action/.tool/bin/qemu-tool"
 py="$scratch/work/action/.tool/venv/bin/python"
 version=$("$tool" --version)
+# An exact version asked for is the one installed: without this, a run meant
+# for 2.1.0 that got the default would pass as if it had covered 2.1.0.
+case "$asked" in
+  [0-9]*) [ "$version" = "qemu-tool $asked" ] || fail "asked for $asked, got '$version'" ;;
+esac
 
 # Every flavor this qemu-tool ships: its fleet takes the action's overlay,
 # renders, and yields an inventory the action can read.
