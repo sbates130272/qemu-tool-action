@@ -7,6 +7,17 @@ that follow the newest matching release.
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-11-23
+
+qemu-tool 3 by default, and four things a downstream CI asked for: a
+strict GPU mode, diagnostics at teardown, your own SSH names for the
+guests, and a limit on the stack coming up.
+
+**Read the first entry under Changed before upgrading.** A job that does
+not pin `qemu-tool-version` moves from qemu-tool 2.1.0 to 3.x, which
+refuses ten fleet XML elements that 2.x read. `qemu-tool-version: '~=2.1'`
+keeps a job on 2.x.
+
 ### Added
 
 - `gpu: required` brings up every guest it can and then fails the step
@@ -228,7 +239,8 @@ that stays on `@v1` has to set `qemu-tool-version` to a 1.x release. See
 Initial release: a composite action wrapping the `qemu-tool` 1.x `gen-vm`,
 `run-vm`, `compose` and `gen-compose` subcommands.
 
-[Unreleased]: https://github.com/sbates130272/qemu-tool-action/compare/v2.1.0...HEAD
+[Unreleased]: https://github.com/sbates130272/qemu-tool-action/compare/v2.2.0...HEAD
+[2.2.0]: https://github.com/sbates130272/qemu-tool-action/compare/v2.1.0...v2.2.0
 [2.1.0]: https://github.com/sbates130272/qemu-tool-action/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/sbates130272/qemu-tool-action/compare/v1.0.0...v2.0.0
 [1.0.0]: https://github.com/sbates130272/qemu-tool-action/releases/tag/v1.0.0
