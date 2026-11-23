@@ -6,20 +6,8 @@ GitHub only updates from the release's web page.
 1. On a branch: move the `[Unreleased]` entries of `CHANGELOG.md` under
    `## [X.Y.Z] - YYYY-MM-DD`, update the link list at its foot, and for a new
    major version change the `@vN` in the README's examples. Merge to `main`
-   with CI green, the `boot` job included.
-
-   The two-guest job, `boot-two`, does not run on pull requests. Push the
-   branch and run it there before merging:
-
-   ```bash
-   gh workflow run "qemu-tool-action - CI" --ref <branch> -f two-guests=true
-   ```
-
-   It runs again on `main` after the merge; wait for that run before
-   tagging. Two guests oversubscribe a hosted runner, so rerun it once if
-   a guest was lost (`vfio-user: timed out waiting for reply`, or a guest
-   that never answered SSH). Any other failure, or a second lost guest,
-   is fixed on a new branch before the tag.
+   with CI green, the three boot jobs included (`boot`, `boot-own` and the
+   two-guest `boot-two`).
 
 2. Tag and push:
 

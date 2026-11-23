@@ -5,11 +5,6 @@ name: qemu-tool-action - CI
 # commit here.
 on:
   workflow_dispatch:
-    inputs:
-      two-guests:
-        description: Also boot two guests and run RDMA between them (as on main and on the schedule)
-        type: boolean
-        default: false
   pull_request:
     branches:
       - main
@@ -443,16 +438,12 @@ jobs:
           if-no-files-found: ignore
 
   # Two guests, which is what a consumer testing RDMA between guests boots.
-  # Two four-vCPU guests on a four-core runner are oversubscribed two to
-  # one, which the NIC mesh's 20 s heartbeat does not always survive. So
-  # not on pull requests, where a lost guest would block a change that did
-  # not cause it: on push to main and on the schedule, where a failure is
-  # seen and blocks nothing, and by hand.
+  # On every event, pull requests included: it is the only job that runs a
+  # script on several guests at once and moves bytes between them. Two
+  # four-vCPU guests on a four-core runner are oversubscribed two to one;
+  # other projects' two-guest CI runs that way.
   boot-two:
     name: Boot two guests
-    if: >-
-      github.event_name == 'push' || github.event_name == 'schedule' ||
-      (github.event_name == 'workflow_dispatch' && inputs.two-guests)
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:

@@ -49,8 +49,9 @@ or not. With no fleet named, as above, it is qemu-tool's default one.
   (`images-dir`).
 - Enough cores. The emulated RDMA NIC's driver does not probe in a guest
   with fewer than four vCPUs, and a standard hosted runner has four cores:
-  one guest at par, two guests oversubscribed two to one. Use `vm-count: 1`
-  on a standard runner and a larger runner for two or more.
+  one guest at par, two guests oversubscribed two to one. This action's
+  own CI boots two there on every pull request; use a larger runner for
+  more than two.
 
 ## Which fleet
 
@@ -287,8 +288,7 @@ or without one and reads `vm-manifest` to find out which.
 ### Two guests and an RDMA test between them
 
 The script runs on every guest at once. Each copy knows which guest it is
-and where its peers are, so one script can play both roles. Two guests want
-a runner with at least eight cores.
+and where its peers are, so one script can play both roles.
 
 ```yaml
 - uses: sbates130272/qemu-tool-action@v2
@@ -643,9 +643,9 @@ self-hosted runner `images-dir` persists and the backing image is reused.
 ## Compatibility
 
 - **This action and qemu-tool.** `@v2` drives qemu-tool 2.x and 3.x. Its
-  CI boots a guest on 2.1.0 and on 3.0.0 on every pull request, and two
-  guests with RDMA between them on every push to `main` and twice a week;
-  on a schedule it also renders every fleet of qemu-minimal's `main`. A
+  CI boots a guest on 2.1.0 and on 3.0.0, and two guests with RDMA
+  between them, on every pull request; on push to `main` and on a
+  schedule it also renders every fleet of qemu-minimal's `main`. A
   new 3.x release needs nothing from you.
 - **Your fleet XML and qemu-tool.** Forward only within a major version:
   a file written for one release reads on later ones, and a file using a

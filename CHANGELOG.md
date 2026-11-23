@@ -36,7 +36,7 @@ that follow the newest matching release.
   and the start of the stack's containers, which had none. Off by default.
   `wait-timeout` remains the limit on the guests' boot.
 - CI boots two guests through the action, with RDMA between them, on every
-  push to `main` and on the schedule; it was a manual job.
+  pull request, push to `main` and scheduled run; it was a manual job.
 
 ### Changed
 
